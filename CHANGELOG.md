@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0] - 2026-11-03
+
+- `/sim` with no simulator booted lists your iOS simulators, newest runtime first, and boots the one you pick (without opening Simulator.app).
+- Lean mode for herdr remote connections: when a herdr client is connected over SSH, frames go at half resolution and at most 10 a second, about a thirtieth of the data. ctrl-y then `b` toggles it by hand.
+- Frames are sent as RGB rather than RGBA, a quarter less data.
+- The ctrl-y hint wraps onto a second row in narrow panes.
+
 ## [0.15.0] - 2026-11-03
 
 - ctrl-y then `q` closes the viewer pane, as ctrl-c does.
