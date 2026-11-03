@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0] - 2026-11-03
+
+- Fold the iPhone Duo from the viewer: Ctrl-Y then `o` (open), `c` (closed), `p` (partly open) or `f` (toggle open/closed). The keys are only shown for foldables.
+- `sim_fold` tool: opens, closes or half-folds a foldable and waits until the expected display is in use.
+- The viewer, screenshots and taps follow whichever of the Duo's displays is lit.
+- The Duo's inner display gets a bezel: Xcode's frame for the outer display, stretched to fit.
+
 ## [0.12.0] - 2026-11-03
 
 - Rotate the device from the viewer: Ctrl-Y then `r` or `→` (clockwise) or `←` (anticlockwise). The picture, bezel and clicks turn with it.
