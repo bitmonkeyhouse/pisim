@@ -1,6 +1,11 @@
-![pi in herdr with pisim's viewer showing an iPhone 18 Pro simulator's home screen in a device bezel](docs/screenshot-home.png)
-
-![pisim's viewer showing an app's setup screen in the simulator while the agent builds and installs it in pi](docs/screenshot-bin-night.png)
+<p>
+<img src="docs/screenshot-duo-closed.png" width="49%" alt="pi in herdr with pisim's viewer showing a folded iPhone Duo simulator running an app, in its device bezel">
+<img src="docs/screenshot-duo-open.png" width="49%" alt="The same app on the iPhone Duo unfolded, shown landscape on its inner display">
+</p>
+<p>
+<img src="docs/screenshot-setup.png" width="49%" alt="pisim's viewer showing an app's setup screen on an iPhone 16 simulator next to pi">
+<img src="docs/screenshot-home.png" width="49%" alt="pisim's viewer showing an iPhone 16 simulator's home screen in a device bezel">
+</p>
 
 # pisim
 
