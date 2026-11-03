@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.14.0] - 2026-11-03
+
+- The viewer widens its herdr pane when the device turns or a foldable opens and no longer fits at physical size, and puts the old width back once it fits again. A pane you've resized yourself, or a zoomed viewer, is left alone.
+
 ## [0.13.0] - 2026-11-03
 
 - Fold the iPhone Duo from the viewer: Ctrl-Y then `o` (open), `c` (closed), `p` (partly open) or `f` (toggle open/closed). The keys are only shown for foldables.
