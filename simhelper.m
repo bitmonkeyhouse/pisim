@@ -19,6 +19,13 @@
 //   the display surface (wrapped as a Metal texture, no copy) into an RGBA texture; the CPU only
 //   reads that back.
 //
+// simhelper describe <udid>
+//   Prints the frontmost app's accessibility tree as JSON: an array holding the app element, each
+//   element { type, AXLabel, AXUniqueId, AXValue, enabled, frame {x, y, width, height}, children },
+//   frames in points from the top-left (the shape `axe describe-ui` prints). Read on the Mac through
+//   the private AccessibilityPlatformTranslation framework, as Simulator.app does, with each request
+//   sent through CoreSimulator; one round trip per element.
+//
 // simhelper bezel-size <pdf>
 //   Prints a DeviceKit bezel PDF's page size in points, "<w> <h>".
 //
@@ -29,8 +36,9 @@
 //   rounded outline, so the hole's corners are filled with the terminal background. Positions are in
 //   pixels from the top-left.
 //
-// The HID connection and wire format, and finding and following the display, follow Meta's idb
-// (MIT licence): FBSimulatorControl/HID, FBSimulatorControl/XPC and FBSimulatorControl/Framebuffer.
+// The HID connection and wire format, finding and following the display, and reading accessibility
+// follow Meta's idb (MIT licence): FBSimulatorControl/HID, FBSimulatorControl/XPC,
+// FBSimulatorControl/Framebuffer and FBSimulatorAX.
 //
 // Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders -framework CoreGraphics -framework ImageIO simhelper.m -o simhelper
 #import <CoreGraphics/CoreGraphics.h>
@@ -58,6 +66,24 @@
                           frameCallback:(void (^)(void))frame
                 surfacesChangedCallback:(void (^)(id, id))surfaces
               propertiesChangedCallback:(void (^)(id))properties;
+// SimDevice, and AccessibilityPlatformTranslation's AXPTranslator, AXPTranslatorRequest and AXPMacPlatformElement.
+- (void)sendAccessibilityRequestAsync:(id)request completionQueue:(dispatch_queue_t)queue completionHandler:(void (^)(id))handler;
++ (id)sharedInstance;
+- (void)setSupportsDelegateTokens:(BOOL)supports;
+- (void)setAccessibilityEnabled:(BOOL)enabled;
+- (void)setBridgeTokenDelegate:(id)delegate;
+- (id)frontmostApplicationWithDisplayId:(unsigned int)display bridgeDelegateToken:(NSString *)token;
+- (id)macPlatformElementFromTranslation:(id)translation;
+- (void)setBridgeDelegateToken:(NSString *)token;
+- (id)translation;
+- (void)setClientType:(unsigned long long)type;
+- (NSString *)accessibilityRole;
+- (NSString *)accessibilityLabel;
+- (NSString *)accessibilityIdentifier;
+- (id)accessibilityValue;
+- (CGRect)accessibilityFrame;
+- (BOOL)isAccessibilityEnabled;
+- (NSArray *)accessibilityChildren;
 @end
 
 static void fail(NSString *msg) {
@@ -314,6 +340,76 @@ static void runVideo(NSString *udid) {
 	dispatch_sync(work, ^{ [NSFileManager.defaultManager removeItemAtPath:dir error:nil]; });
 }
 
+// MARK: - describe
+
+// AXPTranslator asks its bridge delegate how to reach the simulator: each request goes through
+// CoreSimulator to the accessibility service inside it, answered synchronously.
+@interface AccessibilityBridge : NSObject
+@property(strong) id device;
+@end
+
+@implementation AccessibilityBridge
+- (id (^)(id))accessibilityTranslationDelegateBridgeCallbackWithToken:(NSString *)token {
+	id dev = self.device;
+	return ^id(id request) {
+		[request setClientType:4]; // as XCTest: the full tree (buttons' icons and text, groups), not the flattened one
+		__block id response;
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		[dev sendAccessibilityRequestAsync:request
+			completionQueue:dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0)
+			completionHandler:^(id r) {
+				response = r;
+				dispatch_semaphore_signal(done);
+			}];
+		dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+		return response;
+	};
+}
+- (CGRect)accessibilityTranslationConvertPlatformFrameToSystem:(CGRect)rect withToken:(NSString *)token {
+	return rect; // already in the simulator's points
+}
+- (id)accessibilityTranslationRootParentWithToken:(NSString *)token {
+	return nil;
+}
+@end
+
+static id describeElement(id el, NSString *token) {
+	[[el translation] setBridgeDelegateToken:token];
+	NSString *role = [el accessibilityRole];
+	id value = [el accessibilityValue];
+	CGRect f = [el accessibilityFrame];
+	NSMutableArray *children = [NSMutableArray array];
+	for (id child in [el accessibilityChildren]) [children addObject:describeElement(child, token)];
+	return @{
+		@"type" : [role hasPrefix:@"AX"] ? [role substringFromIndex:2] : role ?: @"",
+		@"AXLabel" : [el accessibilityLabel] ?: NSNull.null,
+		@"AXUniqueId" : [el accessibilityIdentifier] ?: NSNull.null,
+		@"AXValue" : value ? [value description] : NSNull.null,
+		@"enabled" : @([el isAccessibilityEnabled]),
+		@"frame" : @{ @"x" : @(f.origin.x), @"y" : @(f.origin.y), @"width" : @(f.size.width), @"height" : @(f.size.height) },
+		@"children" : children,
+	};
+}
+
+static void describeScreen(NSString *udid) {
+	if (!dlopen("/System/Library/PrivateFrameworks/AccessibilityPlatformTranslation.framework/AccessibilityPlatformTranslation", RTLD_NOW)) {
+		fail(@"can't load AccessibilityPlatformTranslation");
+	}
+	AccessibilityBridge *bridge = [AccessibilityBridge new]; // the translator holds its delegate weakly
+	bridge.device = device(udid);
+	id translator = [NSClassFromString(@"AXPTranslator") sharedInstance];
+	[translator setSupportsDelegateTokens:YES];
+	[translator setAccessibilityEnabled:YES];
+	[translator setBridgeTokenDelegate:bridge];
+	NSString *token = NSUUID.UUID.UUIDString;
+	id app = [translator frontmostApplicationWithDisplayId:0 bridgeDelegateToken:token];
+	if (!app) fail(@"no frontmost app (is the simulator booted?)");
+	[app setBridgeDelegateToken:token];
+	NSData *json = [NSJSONSerialization dataWithJSONObject:@[ describeElement([translator macPlatformElementFromTranslation:app], token) ] options:0 error:nil];
+	fwrite(json.bytes, 1, json.length, stdout);
+	printf("\n");
+}
+
 // MARK: - bezel
 
 static CGPDFPageRef pdfPage(const char *path) {
@@ -365,11 +461,12 @@ int main(int argc, char **argv) {
 		const char *cmd = argc > 1 ? argv[1] : "";
 		if (argc == 3 && !strcmp(cmd, "hid")) runHid(@(argv[2]));
 		else if (argc == 3 && !strcmp(cmd, "video")) runVideo(@(argv[2]));
+		else if (argc == 3 && !strcmp(cmd, "describe")) describeScreen(@(argv[2]));
 		else if (argc == 3 && !strcmp(cmd, "bezel-size")) {
 			CGRect box = CGPDFPageGetBoxRect(pdfPage(argv[2]), kCGPDFMediaBox);
 			printf("%.0f %.0f\n", box.size.width, box.size.height);
 		} else if (argc == 16 && !strcmp(cmd, "bezel")) renderBezel(argv + 2);
-		else fail(@"usage: simhelper hid <udid> | video <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>");
+		else fail(@"usage: simhelper hid <udid> | video <udid> | describe <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>");
 	}
 	return 0;
 }

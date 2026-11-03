@@ -39,16 +39,6 @@ export async function simctl(...args: string[]): Promise<string> {
 	}
 }
 
-export async function axe(...args: string[]): Promise<string> {
-	try {
-		return (await run("axe", args, { maxBuffer: 16 << 20 })).stdout;
-	} catch (e) {
-		const err = e as NodeJS.ErrnoException & { stderr?: string };
-		if (err.code === "ENOENT") throw new Error("AXe is not installed: brew install cameroncooke/axe/axe");
-		throw new Error(err.stderr?.trim() || err.message);
-	}
-}
-
 export type AXNode = {
 	type: string;
 	AXLabel?: string | null;
@@ -60,9 +50,16 @@ export type AXNode = {
 };
 
 // The accessibility tree, in points from the top-left; the first root is the app on screen.
-export const uiTree = async (udid: string) => JSON.parse(await axe("describe-ui", "--udid", udid)) as AXNode[];
+export async function uiTree(udid: string): Promise<AXNode[]> {
+	try {
+		return JSON.parse((await run(await helper(), ["describe", udid], { maxBuffer: 16 << 20 })).stdout);
+	} catch (e) {
+		const err = e as Error & { stderr?: string };
+		throw new Error(err.stderr?.trim() || err.message);
+	}
+}
 
-// `axe describe-ui` is ~80KB of JSON; condense to one line per labelled element, nested by depth.
+// The tree's JSON is tens of KB; condense to one line per labelled element, nested by depth.
 export async function describe(udid: string): Promise<string> {
 	const lines: string[] = [];
 	const walk = (n: AXNode, depth: number) => {
