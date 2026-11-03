@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { type AXNode, BUTTONS, buttonLines, describe, type Device, keyLines, keymap, listBooted, screenshot, simctl, startHid, uiTree } from "./sim.ts";
+import { type AXNode, BUTTONS, boot, buttonLines, describe, type Device, keyLines, keymap, listBootable, listBooted, screenshot, simctl, startHid, uiTree } from "./sim.ts";
 
 const run = promisify(execFile);
 const viewer = join(dirname(fileURLToPath(import.meta.url)), "viewer.ts");
@@ -33,13 +33,27 @@ export default function (pi: ExtensionAPI) {
 		return hit;
 	}
 
+	// With nothing booted, asks which simulator to boot and boots it; undefined if the menu is cancelled.
+	async function bootFromMenu(ctx: ExtensionContext): Promise<Device | undefined> {
+		const off = await listBootable();
+		if (off.length === 0) throw new Error("No booted simulators, and none to boot. Create one in Xcode.");
+		const named = off.map((d) => (off.filter((o) => label(o) === label(d)).length > 1 ? `${label(d)} ${d.udid.slice(0, 8)}` : label(d)));
+		const choice = await ctx.ui.select("No simulator is booted. Boot one:", named);
+		const hit = off[named.indexOf(choice!)];
+		if (!hit) return;
+		ctx.ui.notify(`Booting ${hit.name}…`, "info");
+		await boot(hit.udid);
+		return hit;
+	}
+
 	pi.registerCommand("sim", {
-		description: "Show a booted iOS simulator in a herdr pane",
+		description: "Show a booted iOS simulator in a herdr pane, or pick one to boot",
 		handler: async (args, ctx) => {
 			const self = process.env.HERDR_PANE_ID;
 			if (!self) return ctx.ui.notify("/sim needs to run inside herdr", "error");
 			try {
-				const device = await pick(args, ctx);
+				const device = (await listBooted()).length === 0 && ctx.hasUI ? await bootFromMenu(ctx) : await pick(args, ctx);
+				if (!device) return;
 				current = device;
 				const { stdout } = await run("herdr", ["pane", "split", self, "--direction", "right", "--ratio", "0.6"]);
 				const pane = JSON.parse(stdout).result.pane.pane_id as string;

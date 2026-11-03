@@ -18,6 +18,26 @@ export async function listBooted(): Promise<Device[]> {
 	);
 }
 
+// iOS simulators that are shut down and can be booted, newest runtime first.
+export async function listBootable(): Promise<Device[]> {
+	const { stdout } = await run("xcrun", ["simctl", "list", "devices", "available", "-j"]);
+	const { devices } = JSON.parse(stdout) as { devices: Record<string, { udid: string; name: string; state: string }[]> };
+	const version = (runtime: string) => runtime.split("-").slice(1).map(Number); // iOS-27-0 -> [27, 0]
+	return Object.entries(devices)
+		.map(([id, list]) => ({ runtime: id.split(".").pop()!, list }))
+		.filter((r) => r.runtime.startsWith("iOS-"))
+		.sort((a, b) => {
+			const [x, y] = [version(a.runtime), version(b.runtime)];
+			return y[0] - x[0] || (y[1] ?? 0) - (x[1] ?? 0);
+		})
+		.flatMap((r) => r.list.filter((d) => d.state === "Shutdown").map((d) => ({ udid: d.udid, name: d.name, runtime: r.runtime })));
+}
+
+// Boots the simulator and waits until it has finished starting up.
+export async function boot(udid: string): Promise<void> {
+	await run("xcrun", ["simctl", "bootstatus", udid, "-b"]);
+}
+
 // The simctl display UUID of a foldable's lit main display, or undefined for a device with one, where
 // simctl's default is right. simctl lists ports with their buffer widths; the inner display is the
 // wider one, in use when the accessibility tree says so (`turn`).
