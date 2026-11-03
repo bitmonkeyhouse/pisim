@@ -1,7 +1,7 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
 // clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
 // the device bezel is a second image drawn on top. ctrl-y then h/l/s/+/- presses Home, Lock, Siri or
-// volume up/down, r or the arrows rotate the device, z zooms to fill the pane, and on a foldable
+// volume up/down, r or the arrows rotate the device, z zooms to fill the pane, b toggles lean mode, and on a foldable
 // o/c/p open, close or half-fold it and f toggles open and closed; q or Ctrl-C quits. The herdr pane widens
 // when a turned or opened device needs it (fitPane).
 // Usage: node viewer.ts <udid> [label]
@@ -41,6 +41,25 @@ const turn = () => (baseTurn + quarter) % 4;
 let foldable = false; // simhelper video found two main displays (an iPhone Duo)
 let open = false; // a foldable is showing its inner display
 let zoom = false; // fill the pane instead of physical size
+// Lean mode, for herdr clients watching over SSH: herdr sends them every frame as raw pixels, which
+// can swamp the connection and slow the whole window. Frames go at half resolution (the terminal
+// scales them up) and at most 10 a second. On while a remote client is connected to this machine's
+// herdr, unless toggled by hand.
+let lean = false;
+let leanByHand = false;
+const LEAN_FRAME_MS = 100;
+let lastFrameAt = 0;
+async function detectLean() {
+	if (leanByHand) return;
+	// Each remote client has a `herdr remote-client-bridge` here; the program name must be herdr too,
+	// as the ssh command of a client on this machine connecting out to another has that text in it.
+	const { stdout } = await run("ps", ["-A", "-o", "ucomm=,args="]);
+	const remote = /^herdr\s+(\S*\/)?herdr remote-client-bridge\b/m.test(stdout);
+	if (remote !== lean) {
+		lean = remote;
+		relayout();
+	}
+}
 // simhelper hid's orientation for each: portrait, landscape with its top on the right, upside down,
 // landscape with its top on the left.
 const ORIENTATIONS = [1, 4, 2, 3];
@@ -255,7 +274,8 @@ async function relayout() {
 		}
 		out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J`);
 		if (l.bezel) place(2, BEZEL_Z, l.bezel, l.bezel.png);
-		video?.stdin!.write(`rotate ${turn()}\nsize ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);
+		const res = lean ? 0.5 : 1;
+		video?.stdin!.write(`rotate ${turn()}\nsize ${Math.round(l.screen.c * cell.w * res)} ${Math.round(l.screen.r * cell.h * res)}\n`);
 	} catch (e) {
 		fail((e as Error).message);
 	} finally {
@@ -292,7 +312,11 @@ function stream() {
 						open = foldable && baseTurn !== 0;
 						relayout();
 					} else if (frame && layout) {
-						placeScreen(layout.screen, Number(frame[1]), Number(frame[2]), frame[3], () => video?.stdin!.write("next\n"));
+						placeScreen(layout.screen, Number(frame[1]), Number(frame[2]), frame[3], () => {
+							const wait = lean ? lastFrameAt + LEAN_FRAME_MS - Date.now() : 0;
+							lastFrameAt = Date.now() + Math.max(0, wait);
+							setTimeout(() => video?.stdin!.write("next\n"), Math.max(0, wait));
+						});
 					} else if (frame) {
 						rmSync(frame[3], { force: true }); // no layout yet to draw it in
 						video.stdin!.write("next\n");
@@ -317,8 +341,12 @@ let hid: ChildProcess | undefined;
 let hidReady = false;
 let statusShown = false;
 
-function status(msg?: string) {
-	if (msg || statusShown) out.write(`${ESC}[1;1H${ESC}[2K${(msg ?? "").slice(0, out.columns)}`); // one row, which is all it clears
+// Shows a message on the top row, wrapped at a space onto the second if the pane is too narrow.
+function status(msg = "") {
+	if (!msg && !statusShown) return;
+	const cut = msg.length > out.columns ? msg.lastIndexOf(" ", out.columns) : -1;
+	const [first, second] = cut > 0 ? [msg.slice(0, cut), msg.slice(cut + 1)] : [msg, ""];
+	out.write(`${ESC}[1;1H${ESC}[2K${first.slice(0, out.columns)}${ESC}[2;1H${ESC}[2K${second.slice(0, out.columns)}`);
 	statusShown = !!msg;
 }
 
@@ -403,11 +431,16 @@ function onInput(d: Buffer) {
 				zoom = !zoom;
 				relayout();
 			} else if (key === "q") quit();
+			else if (key === "b") {
+				lean = !lean;
+				leanByHand = true;
+				relayout();
+			}
 			else if (foldable && key in FOLD_KEYS) send(`hinge ${FOLD_KEYS[key]}`);
 			else if (foldable && key === "f") send(`hinge ${open ? 0 : 180}`);
 		} else if (tok === "\x19") {
 			buttonPrefix = true;
-			status(`h home l lock s siri +/- vol r rotate z zoom${foldable ? " o/c/p/f fold" : ""} q close`);
+			status(`h home l lock s siri +/- vol r turn z zoom b lean${foldable ? " o/c/p/f fold" : ""} q quit`);
 		} else if (keys.has(tok)) press(keys.get(tok)!);
 	}
 }
@@ -422,4 +455,6 @@ process.on("SIGHUP", quit);
 // Mouse reporting: 1000 press/release, 1002 drags, 1006 SGR encoding, 1016 positions in pixels.
 out.write(`${ESC}[?25l${ESC}[2J${ESC}[?1000h${ESC}[?1002h${ESC}[?1006h${ESC}[?1016h`);
 stream();
+detectLean().catch(() => {});
+setInterval(() => detectLean().catch(() => {}), 3000);
 connectHid();
