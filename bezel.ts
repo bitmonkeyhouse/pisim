@@ -9,8 +9,21 @@ import { helper } from "./sim.ts";
 const run = promisify(execFile);
 
 // In framebuffer pixels: whole bezel w x h, screen hole at x,y sized hw x hh, turned clockwise by
-// `quarter` quarter turns (0 = portrait, as loaded).
-export type Bezel = { pdf: string; dir: string; w: number; h: number; x: number; y: number; hw: number; hh: number; quarter: number };
+// `quarter` quarter turns (0 = portrait, as loaded). `scale` is framebuffer pixels per PDF point;
+// `stretched` frames are drawn stretched to their size rather than scaled (see stretchBezel).
+export type Bezel = {
+	pdf: string;
+	dir: string;
+	w: number;
+	h: number;
+	x: number;
+	y: number;
+	hw: number;
+	hh: number;
+	quarter: number;
+	scale: number;
+	stretched?: boolean;
+};
 
 // The Resources directory of the simulator's device type bundle (profile.plist, capabilities.plist).
 async function deviceResources(udid: string): Promise<string> {
@@ -21,13 +34,16 @@ async function deviceResources(udid: string): Promise<string> {
 	return join(types.find((t) => t.identifier === type)!.bundlePath, "Contents/Resources");
 }
 
-// The device's screen density: framebuffer pixels per inch (460 for recent iPhones, 264 for iPads).
-export async function screenPitch(udid: string): Promise<number> {
+async function screenCapability(udid: string, key: string): Promise<number> {
 	const caps = join(await deviceResources(udid), "capabilities.plist");
-	return Number((await run("plutil", ["-extract", "capabilities.ScreenDimensionsCapability.main-screen-pitch", "raw", caps])).stdout);
+	return Number((await run("plutil", ["-extract", `capabilities.ScreenDimensionsCapability.${key}`, "raw", caps])).stdout);
 }
 
-// Measures the device's bezel (DeviceKit chrome composite) at the scale where its screen hole is `shotWidth` pixels wide.
+// The device's screen density: framebuffer pixels per inch (460 for recent iPhones, 264 for iPads).
+export const screenPitch = (udid: string) => screenCapability(udid, "main-screen-pitch");
+
+// Measures the device's bezel (DeviceKit chrome composite) at the device's screen scale (framebuffer
+// pixels per point), or failing that the scale where its screen hole is `shotWidth` pixels wide.
 export async function loadBezel(udid: string, shotWidth: number): Promise<Bezel> {
 	const profile = join(await deviceResources(udid), "profile.plist");
 	const chrome = (await run("plutil", ["-extract", "chromeIdentifier", "raw", profile])).stdout.trim();
@@ -38,7 +54,7 @@ export async function loadBezel(udid: string, shotWidth: number): Promise<Bezel>
 	const dir = await mkdtemp(join(tmpdir(), "pisim-bezel-"));
 	const [ptW, ptH] = (await run(await helper(), ["bezel-size", pdf])).stdout.trim().split(" ").map(Number);
 	const pt = { w: ptW, h: ptH };
-	const scale = shotWidth / (pt.w - s.leftWidth - s.rightWidth);
+	const scale = (await screenCapability(udid, "main-screen-scale").catch(() => 0)) || shotWidth / (pt.w - s.leftWidth - s.rightWidth);
 	const px = (n: number) => Math.round(n * scale);
 	return {
 		pdf,
@@ -50,6 +66,7 @@ export async function loadBezel(udid: string, shotWidth: number): Promise<Bezel>
 		hw: px(pt.w - s.leftWidth - s.rightWidth),
 		hh: px(pt.h - s.topHeight - s.bottomHeight),
 		quarter: 0,
+		scale,
 	};
 }
 
@@ -63,7 +80,16 @@ export function turnBezel(b: Bezel, q: number): Bezel {
 	return { ...b, x, y, w: odd ? b.h : b.w, h: odd ? b.w : b.h, hw: odd ? b.hh : b.hw, hh: odd ? b.hw : b.hh, quarter: q % 4 };
 }
 
-// Bezel frames fit the screen they were drawn for; anything else (foldables) is shown bare.
+// The portrait bezel's frame, as thick as it is, around a portrait screen of another shape (a
+// foldable's inner display): simhelper builds it from the frame's right side, its left being the
+// folded Duo's hinge, so both sides are as thick as the right.
+export function stretchBezel(b: Bezel, hw: number, hh: number): Bezel {
+	const side = b.w - b.x - b.hw;
+	const bottom = b.h - b.y - b.hh;
+	return { ...b, hw, hh, x: side, w: side + hw + side, h: b.y + hh + bottom, quarter: 0, stretched: true };
+}
+
+// Bezel frames fit the screen they were drawn for; others get a stretched frame.
 export function fits(bezel: Bezel, w: number, h: number): boolean {
 	return Math.abs(w / h / (bezel.hw / bezel.hh) - 1) < 0.02;
 }
@@ -89,6 +115,7 @@ export async function renderBezel(bezel: Bezel, maskedShot: Buffer, o: BezelRend
 	const mask = join(bezel.dir, "mask.png");
 	await writeFile(mask, maskedShot);
 	const nums = [o.w, o.h, o.canvasW, o.canvasH, o.padLeft, o.padTop, o.holeX, o.holeY, o.holeW, o.holeH].map(String);
-	await run(await helper(), ["bezel", bezel.pdf, mask, file, ...nums, o.background, String(bezel.quarter)]);
+	const stretch = bezel.stretched ? [String(bezel.scale * (o.w / bezel.w))] : []; // pixels per PDF point, as drawn
+	await run(await helper(), ["bezel", bezel.pdf, mask, file, ...nums, o.background, String(bezel.quarter), ...stretch]);
 	return readFile(file);
 }

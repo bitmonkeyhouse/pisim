@@ -18,12 +18,25 @@ export async function listBooted(): Promise<Device[]> {
 	);
 }
 
+// The simctl display UUID of a foldable's lit main display, or undefined for a device with one, where
+// simctl's default is right. simctl lists ports with their buffer widths; the inner display is the
+// wider one, in use when the accessibility tree says so (`turn`).
+async function litDisplay(udid: string): Promise<string | undefined> {
+	const ports = [...(await run("xcrun", ["simctl", "io", udid, "enumerate"])).stdout.split("Port:")]
+		.map((p) => ({ uuid: /UUID: (\S+)/.exec(p)?.[1], main: /Display class: 0\b/.test(p), width: Number(/Default width: (\d+)/.exec(p)?.[1]) }))
+		.filter((p) => p.uuid && p.main)
+		.sort((a, b) => b.width - a.width);
+	if (ports.length < 2) return undefined;
+	return (await uiTree(udid))[0]?.turn === 1 ? ports[0].uuid : ports[1].uuid;
+}
+
 // `simctl io screenshot -` doesn't write to stdout, so go through a temp file.
 export async function screenshot(udid: string): Promise<Buffer> {
 	const dir = await mkdtemp(join(tmpdir(), "pisim-"));
 	try {
 		const file = join(dir, "shot.png");
-		await run("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", "--mask=alpha", file]);
+		const display = await litDisplay(udid).catch(() => undefined);
+		await run("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", "--mask=alpha", ...(display ? [`--display=${display}`] : []), file]);
 		return await readFile(file);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -47,6 +60,8 @@ export type AXNode = {
 	enabled?: boolean;
 	frame?: { x: number; y: number; width: number; height: number };
 	children?: AXNode[];
+	turn?: number; // on the root: 1 for a foldable's inner display (see tapPoint in index.ts)
+	displays?: number; // on the root: the device's main displays, 2 on a foldable
 };
 
 // The accessibility tree, in points from the top-left; the first root is the app on screen.
@@ -85,7 +100,7 @@ export async function describe(udid: string): Promise<string> {
 // it changes, and "bezel" renders the device bezel. Built with clang when missing or older than its source.
 const src = join(dirname(fileURLToPath(import.meta.url)), "simhelper.m");
 const bin = src.replace(/\.m$/, "");
-const frameworks = ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO", "Accelerate"];
+const frameworks = ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO", "Accelerate", "IOKit"];
 
 export async function helper(): Promise<string> {
 	if (!existsSync(bin) || statSync(bin).mtimeMs < statSync(src).mtimeMs) {

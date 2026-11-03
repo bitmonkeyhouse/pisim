@@ -1,12 +1,13 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
 // clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
 // the device bezel is a second image drawn on top. Ctrl-Y then h/l/s/+/- presses Home, Lock, Siri or
-// volume up/down, r or the arrows rotate the device, and z zooms to fill the pane; Ctrl-C quits.
+// volume up/down, r or the arrows rotate the device, z zooms to fill the pane, and on a foldable
+// o/c/p open, close or half-fold it and f toggles open and closed; Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { promisify } from "node:util";
-import { type Bezel, fits, loadBezel, renderBezel, screenPitch, turnBezel } from "./bezel.ts";
+import { type Bezel, fits, loadBezel, renderBezel, screenPitch, stretchBezel, turnBezel } from "./bezel.ts";
 import { type Button, buttonLines, helper, keyLines, keymap, screenshot, startHid } from "./sim.ts";
 
 const run = promisify(execFile);
@@ -31,6 +32,12 @@ let layout: Layout | undefined; // recomputed on resize and when the device or t
 // How far the device is turned clockwise, in quarter turns. The display buffer stays portrait, so the
 // picture is turned to match and clicks are turned back.
 let quarter = 0;
+// Quarter turns the streamed display's own picture needs to be upright (a foldable's inner display),
+// from simhelper video; the picture is drawn turned by both.
+let baseTurn = 0;
+const turn = () => (baseTurn + quarter) % 4;
+let foldable = false; // simhelper video found two main displays (an iPhone Duo)
+let open = false; // a foldable is showing its inner display
 let zoom = false; // fill the pane instead of physical size
 // simhelper hid's orientation for each: portrait, landscape with its top on the right, upside down,
 // landscape with its top on the left.
@@ -114,8 +121,10 @@ async function layoutFor(w: number, h: number): Promise<Layout> {
 	const cols = out.columns;
 	const rows = out.rows;
 	bezel ??= await loadBezel(udid, Math.min(w, h)).catch(() => null);
-	const turned = bezel && turnBezel(bezel, quarter);
-	const b = turned && fits(turned, w, h) ? turned : null;
+	// w x h is the screen as shown, turned; the bezel is built portrait, around the unturned buffer.
+	const odd = turn() % 2 === 1;
+	const frame = bezel && (fits(bezel, odd ? h : w, odd ? w : h) ? bezel : stretchBezel(bezel, odd ? h : w, odd ? w : h));
+	const b = frame && turnBezel(frame, turn());
 	const dev = b ?? { w, h, x: 0, y: 0, hw: w, hh: h };
 	const fit = Math.min((Math.max(1, cols - 4) * cell.w) / dev.w, (Math.max(1, rows - 2) * cell.h) / dev.h);
 	const s = zoom ? fit : Math.min(fit, await naturalScale());
@@ -199,12 +208,12 @@ async function relayout() {
 	laying = true;
 	again = false;
 	try {
-		const odd = quarter % 2 === 1;
+		const odd = turn() % 2 === 1;
 		const l = await layoutFor(odd ? source.h : source.w, odd ? source.w : source.h);
 		layout = l;
 		out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J`);
 		if (l.bezel) place(2, BEZEL_Z, l.bezel, l.bezel.png);
-		video?.stdin!.write(`rotate ${quarter}\nsize ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);
+		video?.stdin!.write(`rotate ${turn()}\nsize ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);
 	} catch (e) {
 		fail((e as Error).message);
 	} finally {
@@ -226,15 +235,19 @@ function stream() {
 				buf += d;
 				for (let i; (i = buf.indexOf("\n")) >= 0; buf = buf.slice(i + 1)) {
 					const line = buf.slice(0, i);
-					const src = /^source (\d+) (\d+)$/.exec(line);
+					const src = /^source (\d+) (\d+)(?: (\d))?$/.exec(line);
 					const frame = /^frame (\d+) (\d+) (.+)$/.exec(line);
 					const density = /^ppi ([\d.]+)$/.exec(line);
 					if (density) {
 						ppi = Number(density[1]);
 						gotPpi();
 						if (!zoom) relayout(); // the terminal moved to another display
+					} else if (line === "foldable") {
+						foldable = true;
 					} else if (src) {
 						source = { w: Number(src[1]), h: Number(src[2]) };
+						baseTurn = Number(src[3] ?? 0);
+						open = foldable && baseTurn !== 0;
 						relayout();
 					} else if (frame && layout) {
 						placeScreen(layout.screen, Number(frame[1]), Number(frame[2]), frame[3], () => video?.stdin!.write("next\n"));
@@ -305,7 +318,7 @@ function onMouse(button: number, x: number, y: number, released: boolean) {
 	const p = onScreen(x, y, touching);
 	if (!p) return;
 	// Touches are in the display buffer's portrait coordinates: undo the turn the picture is drawn with.
-	const [bx, by] = [[p.fx, p.fy], [p.fy, 1 - p.fx], [1 - p.fx, 1 - p.fy], [1 - p.fy, p.fx]][quarter];
+	const [bx, by] = [[p.fx, p.fy], [p.fy, 1 - p.fx], [1 - p.fx, 1 - p.fy], [1 - p.fy, p.fx]][turn()];
 	const at = `${bx.toFixed(4)} ${by.toFixed(4)}`;
 	if (released) {
 		if (touching) send(`up ${at}`);
@@ -320,9 +333,12 @@ let keys = new Map<string, number[]>();
 keymap(udid).then((k) => (keys = k));
 const press = (k: number[]) => keyLines(k).forEach(send);
 
-// Ctrl-Y then a key presses a hardware button or rotates the device; any other key cancels.
+// Ctrl-Y then a key presses a hardware button, rotates, zooms or (on a foldable) folds the device;
+// any other key cancels.
 const BUTTON_KEYS: Record<string, Button> = { h: "home", l: "lock", s: "siri", "+": "volume-up", "-": "volume-down" };
 const ROTATE_KEYS: Record<string, number> = { r: 1, "\x1b[C": 1, "\x1b[D": -1 }; // r and → clockwise, ← anticlockwise
+// Hinge angles: open, closed, partial (Device Hub's Book).
+const FOLD_KEYS: Record<string, number> = { o: 180, c: 0, p: 130 };
 let buttonPrefix = false;
 
 function rotate(by: number) {
@@ -338,17 +354,17 @@ function onInput(d: Buffer) {
 		else if (buttonPrefix) {
 			buttonPrefix = false;
 			status();
-			const button = BUTTON_KEYS[tok.toLowerCase()];
-			const turn = ROTATE_KEYS[tok.length > 1 ? tok : tok.toLowerCase()];
-			if (button) buttonLines(button).forEach(send);
-			else if (turn) rotate(turn);
-			else if (tok.toLowerCase() === "z") {
+			const key = tok.length > 1 ? tok : tok.toLowerCase();
+			if (BUTTON_KEYS[key]) buttonLines(BUTTON_KEYS[key]).forEach(send);
+			else if (ROTATE_KEYS[key]) rotate(ROTATE_KEYS[key]);
+			else if (key === "z") {
 				zoom = !zoom;
 				relayout();
-			}
+			} else if (foldable && key in FOLD_KEYS) send(`hinge ${FOLD_KEYS[key]}`);
+			else if (foldable && key === "f") send(`hinge ${open ? 0 : 180}`);
 		} else if (tok === "\x19") {
 			buttonPrefix = true;
-			status("h home l lock s siri +/- vol r/←/→ rotate z zoom");
+			status(`h home l lock s siri +/- vol r/←/→ rotate z zoom${foldable ? " o/c/p/f fold" : ""}`);
 		} else if (keys.has(tok)) press(keys.get(tok)!);
 	}
 }

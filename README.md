@@ -8,7 +8,7 @@ A [pi](https://pi.dev) extension for iOS development: show a booted iOS Simulato
 
 - **`/sim`** opens the simulator in a pane next to pi, in its device bezel. The pane updates only when the screen changes (no CPU while it's still) and runs at the simulator's frame rate while it moves.
 - Click to tap, drag to swipe or scroll, type to type. Input lands in about 0.1 s.
-- The agent gets `sim_screenshot`, `sim_describe`, `sim_tap`, `sim_type`, `sim_button`, `sim_launch` and `sim_open_url`.
+- The agent gets `sim_screenshot`, `sim_describe`, `sim_tap`, `sim_type`, `sim_button`, `sim_fold`, `sim_launch` and `sim_open_url`.
 
 ## Requirements
 
@@ -42,6 +42,7 @@ Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`).
 | Ctrl-Y, then `h` / `l` / `s` / `+` / `-` | Home, Lock (again to wake), Siri, volume up / down |
 | Ctrl-Y, then `r` or `→` / `←` | Rotate the device clockwise / anticlockwise |
 | Ctrl-Y, then `z` | Zoom to fill the pane, or back to actual size |
+| Ctrl-Y, then `o` / `c` / `p` / `f` | On a foldable (iPhone Duo): open, close, half-fold, or toggle open and closed |
 | Ctrl-C | Close the pane |
 
 Click the pane first so it has your keyboard. The scroll wheel goes to herdr, not the simulator, so drag to scroll. Typing follows the simulator's hardware keyboard layout: US, or British for `en_GB` simulators.
@@ -57,6 +58,7 @@ Every tool takes an optional `device` (name or UDID). Without it, the tools use 
 | `sim_tap` | Taps an element by accessibility `label` or `id` (waiting up to 3 s for it), or a point `x`,`y` in points |
 | `sim_type` | Types text into the focused field |
 | `sim_button` | Presses `home`, `lock`, `siri`, `volume-up` or `volume-down` |
+| `sim_fold` | Folds an iPhone Duo `open`, `closed` or `partial`, and waits until the matching display is in use |
 | `sim_launch` | Launches an app by bundle id, optionally restarting it |
 | `sim_open_url` | Opens a URL or deep link |
 
@@ -75,7 +77,7 @@ These use private Apple frameworks (CoreSimulator, AccessibilityPlatformTranslat
 
 - Single touch only: no pinch or two-finger gestures. Long hardware button presses aren't supported.
 - Only US and British keyboard layouts are mapped; characters outside the layout (é, emoji) can't be typed.
-- Tested on iPhones. The iPhone Duo's inner display is untested, and devices whose screen doesn't match their bezel (such as the Duo) are shown without one.
+- Tested on iPhones and the iPhone Duo. The viewer and the agent tools follow whichever of the Duo's displays is lit; Xcode only has a bezel for the outer one, so the inner one gets that frame stretched to fit.
 - The viewer starts the device in portrait. While it's rotated, `sim_tap` by `x`,`y` or by label taps in the wrong place: the agent tools don't know the device has turned.
 
 ## Credits

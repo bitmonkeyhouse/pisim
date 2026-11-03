@@ -91,14 +91,18 @@ export default function (pi: ExtensionAPI) {
 	});
 	const keymaps = new Map<string, ReturnType<typeof keymap>>();
 
-	// Where to tap, as fractions of the screen: the given point, or the centre of the element with the
-	// label (or id), polling the accessibility tree for up to 3s for it to appear.
+	// Where to tap, as fractions of the display buffer: the given point, or the centre of the element
+	// with the label (or id), polling the accessibility tree for up to 3s for it to appear.
 	async function tapPoint(udid: string, t: { label?: string; id?: string; x?: number; y?: number }) {
 		for (const deadline = Date.now() + 3000; ; ) {
 			const roots = await uiTree(udid);
 			const screen = roots[0]?.frame;
 			if (!screen) throw new Error("Couldn't read the screen size from the accessibility tree");
-			if (t.x !== undefined && t.y !== undefined) return [t.x / screen.width, t.y / screen.height];
+			// On a foldable's inner display the root is portrait, as its buffer is, but elements are laid
+			// out landscape: the buffer is the interface turned a quarter anticlockwise (`turn`, from simhelper).
+			const wide = roots[0].turn === 1;
+			const at = (x: number, y: number) => (wide ? [y / screen.width, 1 - x / screen.height] : [x / screen.width, y / screen.height]);
+			if (t.x !== undefined && t.y !== undefined) return at(t.x, t.y);
 			const found = new Map<string, NonNullable<AXNode["frame"]>>(); // by frame, as elements can repeat
 			const walk = (n: AXNode) => {
 				if (n.frame && (t.label !== undefined ? n.AXLabel === t.label : n.AXUniqueId === t.id)) found.set(JSON.stringify(n.frame), n.frame);
@@ -112,7 +116,7 @@ export default function (pi: ExtensionAPI) {
 				a.x <= b.x && a.y <= b.y && a.x + a.width >= b.x + b.width && a.y + a.height >= b.y + b.height;
 			const f = frames.find((a) => frames.every((b) => contains(a, b)));
 			if (frames.length && !f) throw new Error(`${frames.length} separate elements have ${what}; tap by x,y instead (see sim_describe)`);
-			if (f) return [(f.x + f.width / 2) / screen.width, (f.y + f.height / 2) / screen.height];
+			if (f) return at(f.x + f.width / 2, f.y + f.height / 2);
 			if (Date.now() > deadline) throw new Error(`No element with ${what} on screen`);
 			await new Promise((r) => setTimeout(r, 250));
 		}
@@ -183,6 +187,29 @@ export default function (pi: ExtensionAPI) {
 			const { udid } = await pick(params.device ?? "", ctx);
 			await hidSend(udid, buttonLines(params.button));
 			return done(udid, `Pressed ${params.button}`);
+		},
+	});
+
+	// Hinge angles in degrees: Device Hub's Open, Closed and Book presets.
+	const FOLDS = { open: 180, closed: 0, partial: 130 } as const;
+
+	pi.registerTool({
+		name: "sim_fold",
+		label: "Simulator fold",
+		description:
+			"Fold a foldable iOS simulator (iPhone Duo): open (flat, the inner display), closed (the outer display) or partial (half-folded like a book, the inner display). Waits until the device has moved to that display, so sim_describe, sim_tap and sim_screenshot then act on it.",
+		promptSnippet: "Open, close or half-fold a foldable iOS simulator (iPhone Duo)",
+		parameters: Type.Object({ state: StringEnum(Object.keys(FOLDS) as (keyof typeof FOLDS)[]), device }),
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const { udid, name } = await pick(params.device ?? "", ctx);
+			if (((await uiTree(udid))[0]?.displays ?? 1) < 2) throw new Error(`${name} doesn't fold`);
+			await hidSend(udid, [`hinge ${FOLDS[params.state]}`]);
+			// The inner display takes over within about a second of opening; the outer one, of closing.
+			const inner = params.state !== "closed";
+			for (const deadline = Date.now() + 8000; Date.now() < deadline && !signal?.aborted; await new Promise((r) => setTimeout(r, 300))) {
+				if (((await uiTree(udid))[0]?.turn === 1) === inner) return done(udid, `${name} is ${params.state}; the ${inner ? "inner" : "outer"} display is in use`);
+			}
+			throw new Error(`${name} didn't move to its ${inner ? "inner" : "outer"} display within 8s`);
 		},
 	});
 

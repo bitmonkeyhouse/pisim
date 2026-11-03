@@ -6,6 +6,7 @@
 //     down <x> <y> | move <x> <y> | up <x> <y>   touch, x/y as fractions of the screen from top-left
 //     key <usage> down|up                         USB HID keyboard usage code
 //     button <page> <usage> down|up              hardware button, as a HID usage page and code
+//     hinge <degrees>                             fold a foldable: 0 closed to 180 flat
 //     orientation <1-4>                           rotate the device: portrait, upside down, landscape
 //                                                 with its top on the left (3) or on the right (4)
 //   Touch coordinates are in the display buffer, which stays portrait when the device rotates.
@@ -20,7 +21,9 @@
 //                    this arrives)
 //     next           the reader is ready for another frame
 //   stdout:
-//     source <w> <h>         the display buffer's size in pixels, at start and whenever it changes
+//     foldable               first, if the device has two main displays (an iPhone Duo)
+//     source <w> <h> <turn>  the display buffer's size in pixels and the clockwise quarter turns its
+//                            picture needs to be upright, at start and whenever the display changes
 //     frame <w> <h> <path>   a w x h RGBA file; the reader (the terminal, via Kitty's t=t) deletes it
 //     ppi <n>                pixels per inch of the display showing the terminal (the frontmost
 //                            window of the given apps), at start and whenever it changes
@@ -33,27 +36,32 @@
 //   element { type, AXLabel, AXUniqueId, AXValue, enabled, frame {x, y, width, height}, children },
 //   frames in points from the top-left (the shape `axe describe-ui` prints). Read on the Mac through
 //   the private AccessibilityPlatformTranslation framework, as Simulator.app does, with each request
-//   sent through CoreSimulator; one round trip per element.
+//   sent through CoreSimulator; one round trip per element. The app element also has `turn`: 1 on a
+//   foldable's inner display, whose root frame is portrait but whose elements are laid out landscape;
+//   and `displays`, the number of main displays (2 on a foldable).
 //
 // simhelper bezel-size <pdf>
 //   Prints a DeviceKit bezel PDF's page size in points, "<w> <h>".
 //
-// simhelper bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter>
+// simhelper bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter> [<stretch>]
 //   Draws the bezel at w x h on a transparent canvasW x canvasH canvas at padLeft,padTop, turned
 //   clockwise by `quarter` quarter turns, with the screen cut out of the hole rect in the shape of
 //   mask.png's alpha (a masked screenshot), so frames drawn underneath show through. Frames have
 //   square corners whose tips stick out past the bezel's rounded outline, so the hole's corners are
 //   filled with the terminal background. Positions are in pixels from the top-left, after turning.
+//   With <stretch> (pixels per PDF point) the frame is stretched to w x h instead of scaled: its
+//   corners drawn at that scale and its edges stretched between them, for a screen of another shape.
 //
 // The HID connection and wire format, finding and following the display, and reading accessibility
 // follow Meta's idb (MIT licence): FBSimulatorControl/HID, FBSimulatorControl/XPC,
 // FBSimulatorControl/Framebuffer and FBSimulatorAX.
 //
-// Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders -framework CoreGraphics -framework ImageIO -framework Accelerate simhelper.m -o simhelper
+// Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders -framework CoreGraphics -framework ImageIO -framework Accelerate -framework IOKit simhelper.m -o simhelper
 #import <Accelerate/Accelerate.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
+#import <IOKit/IOCFSerialize.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
@@ -94,6 +102,9 @@
 - (CGRect)accessibilityFrame;
 - (BOOL)isAccessibilityEnabled;
 - (NSArray *)accessibilityChildren;
+// SimScreen's properties.
+- (id)screenProperties;
+- (id)uniqueId;
 @end
 
 static void fail(NSString *msg) {
@@ -118,6 +129,67 @@ static id device(NSString *udid) {
 	id d = [[[context defaultDeviceSetWithError:&err] devicesByUDID] objectForKey:[[NSUUID alloc] initWithUUIDString:udid]];
 	if (!d) fail([NSString stringWithFormat:@"no simulator %@ (%@)", udid, err.localizedDescription ?: @"not found"]);
 	return d;
+}
+
+// MARK: - displays
+
+// The port descriptors of the device's main displays (displayClass 0): one on an iPhone; an iPhone
+// Duo has two, inner (unfolded) and outer, of which only one is lit at a time.
+static NSArray *mainScreens(id dev) {
+	NSMutableArray *screens = [NSMutableArray array];
+	for (id port in [[dev io] ioPorts]) {
+		id d = [port descriptor];
+		if (![d respondsToSelector:@selector(framebufferSurface)] || ![d respondsToSelector:NSSelectorFromString(@"state")]) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks" // `state` by selector: the name clashes with Foundation's
+		id state = [d performSelector:NSSelectorFromString(@"state")];
+#pragma clang diagnostic pop
+		if ([state respondsToSelector:@selector(displayClass)] && [state displayClass] == 0 && [d framebufferSurface]) [screens addObject:d];
+	}
+	if (!screens.count) fail(@"no main display (is the simulator booted?)");
+	return screens;
+}
+
+// Whether a display is lit: an unlit one's buffer is black, so look for any light pixel on a sparse grid.
+static bool lit(IOSurfaceRef s) {
+	if (!s || IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL)) return false;
+	const uint8_t *base = IOSurfaceGetBaseAddress(s);
+	size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), row = IOSurfaceGetBytesPerRow(s);
+	bool any = false;
+	for (size_t y = h / 32; y < h && !any; y += h / 16 + 1)
+		for (size_t x = w / 32; x < w && !any; x += w / 16 + 1) {
+			const uint8_t *p = base + y * row + x * 4;
+			any = p[0] > 8 || p[1] > 8 || p[2] > 8;
+		}
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	return any;
+}
+
+// Which of the main displays is in use: `current` while it's lit or nothing else is, else the lit one.
+static NSUInteger activeScreen(NSArray *screens, NSUInteger current) {
+	if (screens.count < 2 || lit((__bridge IOSurfaceRef)[screens[current] framebufferSurface])) return current;
+	for (NSUInteger i = 0; i < screens.count; i++)
+		if (lit((__bridge IOSurfaceRef)[screens[i] framebufferSurface])) return i;
+	return current;
+}
+
+// A foldable's inner display is its widest main display; its picture lies a quarter turn anticlockwise
+// in its buffer. shortcut: measured on the iPhone Duo (iOS 27.1).
+static NSUInteger widestScreen(NSArray *screens) {
+	NSUInteger widest = 0;
+	for (NSUInteger i = 1; i < screens.count; i++)
+		if (IOSurfaceGetWidth((__bridge IOSurfaceRef)[screens[i] framebufferSurface]) > IOSurfaceGetWidth((__bridge IOSurfaceRef)[screens[widest] framebufferSurface])) widest = i;
+	return widest;
+}
+
+// The quarter turns a main display's picture needs to be upright.
+static unsigned screenTurn(NSArray *screens, NSUInteger i) {
+	return screens.count > 1 && i == widestScreen(screens) ? 1 : 0;
+}
+
+static NSString *uniqueId(id screen) {
+	id props = [screen respondsToSelector:@selector(screenProperties)] ? [screen screenProperties] : nil;
+	return [props respondsToSelector:@selector(uniqueId)] ? [[props uniqueId] description] : nil;
 }
 
 // MARK: - hid
@@ -164,7 +236,7 @@ static xpc_object_t keyPayload(uint64_t usage, bool down) {
 }
 
 // eventType: start = 0, position = 1, end = 2.
-static xpc_object_t touchEvent(double x, double y, uint64_t type) {
+static xpc_object_t touchEvent(double x, double y, uint64_t type, uint64_t target) {
 	xpc_object_t point = xpc_dictionary_create(NULL, NULL, 0);
 	xpc_dictionary_set_double(point, "x", x);
 	xpc_dictionary_set_double(point, "y", y);
@@ -172,7 +244,7 @@ static xpc_object_t touchEvent(double x, double y, uint64_t type) {
 	xpc_dictionary_set_value(p, "pointOne", point);
 	xpc_dictionary_set_uint64(p, "eventType", type);
 	xpc_dictionary_set_uint64(p, "edge", 0);
-	xpc_dictionary_set_uint64(p, "target", 0);
+	xpc_dictionary_set_uint64(p, "target", target); // the display's touchscreen; 0 is the main display
 	return message("IndigoDigitizerEvent", false, p);
 }
 
@@ -199,8 +271,89 @@ static void sendOrientation(id dev, uint32_t orientation) {
 	if (kr != KERN_SUCCESS) fprintf(stderr, "simhelper: orientation not sent: %s\n", mach_error_string(kr));
 }
 
+// A display's touchscreen target, by display uniqueId: the low byte of each touchscreen's service ID
+// (0x1nn), from the universal HID service's list of connected services, as idb reads them. Empty on
+// a device whose touchscreen names no display (an iPhone), where target 0 is right.
+static NSDictionary<NSString *, NSNumber *> *touchTargets(id dev) {
+	NSMutableDictionary *targets = [NSMutableDictionary dictionary];
+	NSError *err;
+	if (![dev lookup:@"com.apple.coredevice.feature.remote.universalhidservice" error:&err]) return targets;
+	xpc_connection_t conn = connectTo(dev, @"com.apple.coredevice.feature.remote.universalhidservice");
+	xpc_connection_set_event_handler(conn, ^(xpc_object_t e){
+	});
+	xpc_connection_resume(conn);
+	xpc_object_t payload = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_value(payload, "connectedServices", xpc_dictionary_create(NULL, NULL, 0));
+	xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_bool(request, "isBarrier", false);
+	xpc_dictionary_set_value(request, "payload", payload);
+	xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, request);
+	xpc_object_t services = xpc_get_type(reply) == XPC_TYPE_DICTIONARY ? xpc_dictionary_get_value(reply, "connectedServices") : NULL;
+	if (services && xpc_get_type(services) == XPC_TYPE_ARRAY) {
+		xpc_array_apply(services, ^bool(size_t i, xpc_object_t s) {
+			const char *display = xpc_dictionary_get_string(s, "displayUUID");
+			uint64_t id = xpc_dictionary_get_uint64(s, "_ServiceID");
+			bool touchscreen = xpc_dictionary_get_uint64(s, "PrimaryUsagePage") == 0x0D && xpc_dictionary_get_uint64(s, "PrimaryUsage") == 0x04;
+			if (touchscreen && display && (id & ~0xFFull) == 0x100) targets[@(display)] = @(id & 0xFF);
+			return true;
+		});
+	}
+	xpc_connection_cancel(conn);
+	return targets;
+}
+
+// The hinge of a foldable, 0 (closed) to 180 (flat) degrees: a vendor-defined HID report from the
+// virtual machine's hinge slider, on dtuhidd's vendor-defined service, as idb's SimulatorHingeAngle.
+// The connection is made on first use; dtuhidd acts on events only after answering a barrier.
+static void sendHinge(id dev, double degrees) {
+	static xpc_connection_t conn;
+	static NSString *const service = @"com.apple.coredevice.feature.remote.hid.vendordefined";
+	NSDictionary *control = @{ @"provider" : @"com.apple.Virtualization.VirtualMachines", @"source" : @"hinge-slider-control", @"type" : @"range", @"value" : @(degrees) };
+	NSData *data = CFBridgingRelease(IOCFSerialize((__bridge CFTypeRef)control, kIOCFSerializeToBinary));
+	xpc_object_t report = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_uint64(report, "usagePage", 0xff61);
+	xpc_dictionary_set_uint64(report, "usage", 0x5b);
+	xpc_dictionary_set_uint64(report, "version", 0);
+	xpc_dictionary_set_data(report, "data", data.bytes, data.length);
+	xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_string(event, "messageType", "IndigoVendorDefinedEvent");
+	xpc_dictionary_set_string(event, "featureIdentifier", service.UTF8String);
+	xpc_dictionary_set_value(event, "payload", report);
+	if (!conn) {
+		NSError *err;
+		if (![dev lookup:service error:&err]) {
+			fprintf(stderr, "simhelper: no hinge on this device\n");
+			return;
+		}
+		conn = connectTo(dev, service);
+		xpc_connection_set_event_handler(conn, ^(xpc_object_t e){
+		});
+		xpc_connection_resume(conn);
+		xpc_dictionary_set_bool(event, "isBarrier", true);
+		xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, event);
+		if (xpc_get_type(reply) == XPC_TYPE_ERROR) {
+			fprintf(stderr, "simhelper: hinge service didn't answer\n");
+			conn = nil;
+			return;
+		}
+		usleep(200000);
+	}
+	xpc_dictionary_set_bool(event, "isBarrier", false);
+	xpc_connection_send_message(conn, event);
+}
+
 static void runHid(NSString *udid) {
 	id dev = device(udid);
+	NSArray *screens = mainScreens(dev);
+	// Looked up while dtuhidd answers its barrier below (seconds on an iPhone Duo); the first touch waits for it.
+	__block NSDictionary *targets = @{};
+	dispatch_group_t lookingUp = dispatch_group_create();
+	if (screens.count > 1) {
+		dispatch_group_async(lookingUp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+			targets = touchTargets(dev);
+		});
+	}
+	NSUInteger screen = 0; // which of `screens` touches go to
 	xpc_connection_t conn = connectTo(dev, Service);
 	xpc_connection_set_target_queue(conn, dispatch_queue_create("simhelper.hid", DISPATCH_QUEUE_SERIAL));
 	xpc_connection_set_event_handler(conn, ^(xpc_object_t e) {
@@ -230,8 +383,12 @@ static void runHid(NSString *udid) {
 		unsigned long long usage, page;
 		if (sscanf(line, "%7s %lf %lf", cmd, &x, &y) == 3 && (!strcmp(cmd, "down") || !strcmp(cmd, "move") || !strcmp(cmd, "up"))) {
 			uint64_t type = !strcmp(cmd, "up") ? 2 : touching ? 1 : 0; // a down while touching continues the contact
+			if (type == 0) { // aim the touch at the lit display
+				dispatch_group_wait(lookingUp, DISPATCH_TIME_FOREVER);
+				screen = activeScreen(screens, screen);
+			}
 			touching = type != 2;
-			xpc_connection_send_message(conn, touchEvent(x, y, type));
+			xpc_connection_send_message(conn, touchEvent(x, y, type, [targets[uniqueId(screens[screen]) ?: @""] unsignedLongLongValue]));
 		} else if (sscanf(line, "key %llu %7s", &usage, state) == 2) {
 			xpc_connection_send_message(conn, message("IndigoKeyboardButtonEvent", false, keyPayload(usage, !strcmp(state, "down"))));
 		} else if (sscanf(line, "button %llu %llu %7s", &page, &usage, state) == 3) {
@@ -242,6 +399,8 @@ static void runHid(NSString *udid) {
 			xpc_connection_send_message(conn, message("IndigoButtonEvent", false, p));
 		} else if (sscanf(line, "orientation %llu", &usage) == 1 && usage >= 1 && usage <= 4) {
 			sendOrientation(dev, (uint32_t)usage);
+		} else if (sscanf(line, "hinge %lf", &x) == 1 && x >= 0 && x <= 180) {
+			sendHinge(dev, x);
 		} else {
 			fprintf(stderr, "simhelper: ignoring %s", line);
 		}
@@ -251,26 +410,13 @@ static void runHid(NSString *udid) {
 
 // MARK: - video
 
-// The main display's port descriptor: displayClass 0 (iOS's main screen).
-static id mainDisplay(id dev) {
-	for (id port in [[dev io] ioPorts]) {
-		id d = [port descriptor];
-		if (![d respondsToSelector:@selector(framebufferSurface)] || ![d respondsToSelector:NSSelectorFromString(@"state")]) continue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks" // `state` by selector: the name clashes with Foundation's
-		id state = [d performSelector:NSSelectorFromString(@"state")];
-#pragma clang diagnostic pop
-		if ([state respondsToSelector:@selector(displayClass)] && [state displayClass] == 0) return d;
-	}
-	fail(@"no main display (is the simulator booted?)");
-	return nil;
-}
 
 // All state below is touched only on `work`.
 static dispatch_queue_t work;
 static IOSurfaceRef surface;
 static size_t srcW, srcH, outW, outH; // out: the delivered size, after turning
 static unsigned quarter;              // clockwise quarter turns to apply
+static unsigned baseTurn;             // quarter turns the display's own picture needs, reported to the reader
 static bool dirty = true, wanted = true;
 static unsigned long frameNo;
 static NSString *dir;
@@ -293,7 +439,7 @@ static void deliver(void) {
 	size_t w = IOSurfaceGetWidth(surface), h = IOSurfaceGetHeight(surface);
 	if (w != srcW || h != srcH) { // new size: report it and wait for the reader to choose a scale
 		srcW = w, srcH = h, outW = outH = 0;
-		printf("source %zu %zu\n", w, h);
+		printf("source %zu %zu %u\n", w, h, baseTurn);
 		return;
 	}
 	if (!outW) return;
@@ -373,28 +519,45 @@ static void runVideo(NSString *udid, NSArray<NSNumber *> *terminalPids) {
 	gpuQueue = [gpu newCommandQueue];
 	scaler = [[MPSImageLanczosScale alloc] initWithDevice:gpu];
 
-	id display = mainDisplay(device(udid));
-	dispatch_sync(work, ^{ setSurface((__bridge IOSurfaceRef)[display framebufferSurface]); });
+	// Stream the lit main display, switching when another one lights up (a foldable folded or unfolded).
+	NSArray *screens = mainScreens(device(udid));
+	__block NSUInteger current = 0;
+	void (^show)(NSUInteger) = ^(NSUInteger i) {
+		current = i;
+		baseTurn = screenTurn(screens, i);
+		srcW = srcH = 0; // report the display's size and turn afresh
+		setSurface((__bridge IOSurfaceRef)[screens[i] framebufferSurface]);
+	};
+	dispatch_sync(work, ^{
+		if (screens.count > 1) printf("foldable\n");
+		show(activeScreen(screens, 0));
+	});
 	// CoreSimulator waits for these callbacks to return, so they only flag work for `work`.
 	dispatch_queue_t callbacks = dispatch_queue_create("simhelper.callbacks", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-	[display registerScreenCallbacksWithUUID:[NSUUID UUID]
-		callbackQueue:callbacks
-		frameCallback:^{
-			dispatch_async(work, ^{
-				dirty = true;
-				deliver();
-			});
-		}
-		surfacesChangedCallback:^(id framebuffer, id masked) {
-			IOSurfaceRef s = (IOSurfaceRef)CFBridgingRetain(framebuffer);
-			dispatch_async(work, ^{
-				setSurface(s);
-				if (s) CFRelease(s);
-				deliver();
-			});
-		}
-		propertiesChangedCallback:^(id properties){
-		}];
+	for (NSUInteger i = 0; i < screens.count; i++) {
+		id screen = screens[i];
+		[screen registerScreenCallbacksWithUUID:[NSUUID UUID]
+			callbackQueue:callbacks
+			frameCallback:^{
+				dispatch_async(work, ^{
+					// Another display drawing a lit frame is the one the device has moved to.
+					if (i != current && !lit((__bridge IOSurfaceRef)[screen framebufferSurface])) return;
+					if (i != current) show(i);
+					dirty = true;
+					deliver();
+				});
+			}
+			surfacesChangedCallback:^(id framebuffer, id masked) {
+				IOSurfaceRef s = (IOSurfaceRef)CFBridgingRetain(framebuffer);
+				dispatch_async(work, ^{
+					if (i == current) setSurface(s);
+					if (s) CFRelease(s);
+					deliver();
+				});
+			}
+			propertiesChangedCallback:^(id properties){
+			}];
+	}
 
 	// Watch which display the terminal is on, so the viewer can keep the device at physical size.
 	// Printed on `work`, like everything else on stdout, so lines don't interleave.
@@ -402,6 +565,12 @@ static void runVideo(NSString *udid, NSArray<NSNumber *> *terminalPids) {
 	dispatch_source_t watch = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, work);
 	dispatch_source_set_timer(watch, DISPATCH_TIME_NOW, NSEC_PER_SEC, NSEC_PER_SEC / 4);
 	dispatch_source_set_event_handler(watch, ^{
+		// A display that went dark without the other drawing (unlikely) is caught here too.
+		NSUInteger active = activeScreen(screens, current);
+		if (active != current) {
+			show(active);
+			deliver();
+		}
 		double now = terminalPpi(terminalPids);
 		if (fabs(now - ppi) < 1) return;
 		ppi = now;
@@ -491,6 +660,7 @@ static void describeScreen(NSString *udid) {
 	}
 	AccessibilityBridge *bridge = [AccessibilityBridge new]; // the translator holds its delegate weakly
 	bridge.device = device(udid);
+	NSArray *screens = mainScreens(bridge.device);
 	id translator = [NSClassFromString(@"AXPTranslator") sharedInstance];
 	[translator setSupportsDelegateTokens:YES];
 	[translator setAccessibilityEnabled:YES];
@@ -499,7 +669,10 @@ static void describeScreen(NSString *udid) {
 	id app = [translator frontmostApplicationWithDisplayId:0 bridgeDelegateToken:token];
 	if (!app) fail(@"no frontmost app (is the simulator booted?)");
 	[app setBridgeDelegateToken:token];
-	NSData *json = [NSJSONSerialization dataWithJSONObject:@[ describeElement([translator macPlatformElementFromTranslation:app], token) ] options:0 error:nil];
+	NSMutableDictionary *root = [describeElement([translator macPlatformElementFromTranslation:app], token) mutableCopy];
+	root[@"turn"] = @(screenTurn(screens, activeScreen(screens, 0))); // the tree's frames are in that display's points
+	root[@"displays"] = @(screens.count);
+	NSData *json = [NSJSONSerialization dataWithJSONObject:@[ root ] options:0 error:nil];
 	fwrite(json.bytes, 1, json.length, stdout);
 	printf("\n");
 }
@@ -513,13 +686,26 @@ static CGPDFPageRef pdfPage(const char *path) {
 	return p;
 }
 
-// argv: <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter>
-static void renderBezel(char **argv) {
+// Draws the part `src` of a PDF page (its own points, y up) into `dst` (the current coordinates),
+// mirrored left to right if `mirror`.
+static void drawPart(CGContextRef ctx, CGPDFPageRef p, CGRect src, CGRect dst, bool mirror) {
+	CGContextSaveGState(ctx);
+	CGContextClipToRect(ctx, dst);
+	CGContextTranslateCTM(ctx, mirror ? CGRectGetMaxX(dst) : dst.origin.x, dst.origin.y);
+	CGContextScaleCTM(ctx, (mirror ? -1 : 1) * dst.size.width / src.size.width, dst.size.height / src.size.height);
+	CGContextTranslateCTM(ctx, -src.origin.x, -src.origin.y);
+	CGContextDrawPDFPage(ctx, p);
+	CGContextRestoreGState(ctx);
+}
+
+// argv: <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter> [<stretch>]
+static void renderBezel(char **argv, bool stretched) {
 	double n[10];
 	for (int i = 0; i < 10; i++) n[i] = atof(argv[3 + i]);
 	double w = n[0], h = n[1], cw = n[2], ch = n[3], padLeft = n[4], padTop = n[5];
 	unsigned rgb = (unsigned)strtoul(argv[13], NULL, 16);
 	int q = atoi(argv[14]) % 4;
+	double scale = stretched ? atof(argv[15]) : 0; // pixels per PDF point, keeping the frame's thickness
 	// Core Graphics puts the origin at the bottom-left, so flip y.
 	CGRect hole = CGRectMake(n[6], ch - n[7] - n[9], n[8], n[9]);
 
@@ -531,12 +717,34 @@ static void renderBezel(char **argv) {
 	// The PDF is drawn turned about the centre of its w x h box; before turning it is h x w for odd q.
 	CGPDFPageRef p = pdfPage(argv[0]);
 	CGRect box = CGPDFPageGetBoxRect(p, kCGPDFMediaBox);
+	double bw = q % 2 ? h : w, bh = q % 2 ? w : h;
 	CGContextSaveGState(ctx);
 	CGContextTranslateCTM(ctx, padLeft + w / 2, ch - padTop - h / 2);
 	CGContextRotateCTM(ctx, -q * M_PI_2); // negative is clockwise with y up
-	CGContextScaleCTM(ctx, (q % 2 ? h : w) / box.size.width, (q % 2 ? w : h) / box.size.height);
-	CGContextTranslateCTM(ctx, -box.origin.x - box.size.width / 2, -box.origin.y - box.size.height / 2);
-	CGContextDrawPDFPage(ctx, p);
+	if (!stretched) {
+		CGContextScaleCTM(ctx, bw / box.size.width, bh / box.size.height);
+		CGContextTranslateCTM(ctx, -box.origin.x - box.size.width / 2, -box.origin.y - box.size.height / 2);
+		CGContextDrawPDFPage(ctx, p);
+	} else {
+		// Stretched to a screen of another shape (a foldable's inner display). The folded Duo's frame has
+		// its hinge on the left, so build from its right side: the right corners as drawn, and mirrored
+		// for the left; one-point strips of the edges stretched between them, taken just inside the right
+		// corners (the right edge's below its button). Edges go first, a pixel under the corners, to
+		// hide seams. The middle is the screen.
+		double c = 90, ox = box.origin.x, oy = box.origin.y, W = box.size.width, H = box.size.height, cp = round(c * scale); // whole pixels, so clips don't blend at the joins
+		double l = -bw / 2, r = bw / 2 - cp, b = -bh / 2, t = bh / 2 - cp, mw = bw - 2 * cp, mh = bh - 2 * cp;
+		CGRect corner[2] = { CGRectMake(ox + W - c, oy, c, c), CGRectMake(ox + W - c, oy + H - c, c, c) }; // bottom, top right
+		CGRect rows[2] = { CGRectMake(ox + W - c - 1, oy, 1, c), CGRectMake(ox + W - c - 1, oy + H - c, 1, c) }; // bottom, top edge
+		CGRect side = CGRectMake(ox + W - c, oy + c, c, 1); // right edge
+		drawPart(ctx, p, rows[0], CGRectMake(l + cp - 1, b, mw + 2, cp), false);
+		drawPart(ctx, p, rows[1], CGRectMake(l + cp - 1, t, mw + 2, cp), false);
+		drawPart(ctx, p, side, CGRectMake(r, b + cp - 1, cp, mh + 2), false);
+		drawPart(ctx, p, side, CGRectMake(l, b + cp - 1, cp, mh + 2), true);
+		drawPart(ctx, p, corner[0], CGRectMake(r, b, cp, cp), false);
+		drawPart(ctx, p, corner[1], CGRectMake(r, t, cp, cp), false);
+		drawPart(ctx, p, corner[0], CGRectMake(l, b, cp, cp), true);
+		drawPart(ctx, p, corner[1], CGRectMake(l, t, cp, cp), true);
+	}
 	CGContextRestoreGState(ctx);
 
 	CGImageSourceRef maskSrc = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(argv[1])], NULL);
@@ -571,8 +779,8 @@ int main(int argc, char **argv) {
 		else if (argc == 3 && !strcmp(cmd, "bezel-size")) {
 			CGRect box = CGPDFPageGetBoxRect(pdfPage(argv[2]), kCGPDFMediaBox);
 			printf("%.0f %.0f\n", box.size.width, box.size.height);
-		} else if (argc == 17 && !strcmp(cmd, "bezel")) renderBezel(argv + 2);
-		else fail(@"usage: simhelper hid <udid> | video <udid> | describe <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter>");
+		} else if ((argc == 17 || argc == 18) && !strcmp(cmd, "bezel")) renderBezel(argv + 2, argc == 18);
+		else fail(@"usage: simhelper hid <udid> | video <udid> | describe <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter> [<stretch>]");
 	}
 	return 0;
 }
