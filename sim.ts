@@ -83,36 +83,31 @@ export async function describe(udid: string): Promise<string> {
 	return lines.join("\n");
 }
 
-// Native helpers, built with clang when missing or older than their source:
-// simhid (simhid.m) sends touches and keys over one connection kept open to the simulator (a fresh
-// connection per event costs ~0.5s); simvideo (simvideo.m) streams the display when it changes and
-// renders the device bezel.
-const here = dirname(fileURLToPath(import.meta.url));
-const frameworks = {
-	simhid: ["Foundation"],
-	simvideo: ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO"],
-};
+// simhelper (simhelper.m) is the native side: "hid" sends touches and keys over one connection kept
+// open to the simulator (a fresh connection per event costs ~0.5s), "video" streams the display when
+// it changes, and "bezel" renders the device bezel. Built with clang when missing or older than its source.
+const src = join(dirname(fileURLToPath(import.meta.url)), "simhelper.m");
+const bin = src.replace(/\.m$/, "");
+const frameworks = ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO"];
 
-export async function helper(name: keyof typeof frameworks): Promise<string> {
-	const src = join(here, `${name}.m`);
-	const bin = join(here, name);
+export async function helper(): Promise<string> {
 	if (!existsSync(bin) || statSync(bin).mtimeMs < statSync(src).mtimeMs) {
-		await run("clang", ["-fobjc-arc", ...frameworks[name].flatMap((f) => ["-framework", f]), src, "-o", bin]);
+		await run("clang", ["-fobjc-arc", ...frameworks.flatMap((f) => ["-framework", f]), src, "-o", bin]);
 	}
 	return bin;
 }
 
-// Starts simhid for a simulator, resolving once it's connected. Write lines to its stdin:
+// Starts simhelper hid for a simulator, resolving once it's connected. Write lines to its stdin:
 // "down|move|up <x> <y>" (fractions of the screen) or "key <usage> down|up".
 export async function startHid(udid: string): Promise<ChildProcess> {
-	const bin = await helper("simhid");
+	const bin = await helper();
 	return new Promise((resolve, reject) => {
 		let err = "";
-		const p = spawn(bin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
+		const p = spawn(bin, ["hid", udid], { stdio: ["pipe", "pipe", "pipe"] });
 		p.stdin!.on("error", () => {}); // a dead helper is reported by "close"
 		p.stderr!.on("data", (d) => (err += d));
 		p.stdout!.once("data", () => resolve(p));
-		p.on("close", () => reject(new Error(err.trim().split("\n").pop() || "simhid exited")));
+		p.on("close", () => reject(new Error(err.trim().split("\n").pop() || "simhelper hid exited")));
 	});
 }
 
@@ -138,5 +133,5 @@ export async function keymap(udid: string): Promise<Map<string, number[]>> {
 	return keys;
 }
 
-// simhid lines that press and release a key with its modifiers.
+// simhelper hid lines that press and release a key with its modifiers.
 export const keyLines = (keys: number[]) => [...keys.map((k) => `key ${k} down`), ...keys.toReversed().map((k) => `key ${k} up`)];

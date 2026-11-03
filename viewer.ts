@@ -1,5 +1,5 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
-// clicks tap, drags swipe, typing types. Frames come from simvideo only when the display changes;
+// clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
 // the device bezel is a second image drawn on top. Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, spawn } from "node:child_process";
@@ -22,11 +22,11 @@ let cell = { w: 8, h: 16 }; // fallbacks if the terminal doesn't answer
 let background = "000000";
 let bezel: Bezel | null | undefined; // null when the device has no usable bezel
 let video: ChildProcess | undefined;
-let source: { w: number; h: number } | undefined; // the display's size in pixels, from simvideo
+let source: { w: number; h: number } | undefined; // the display's size in pixels, from simhelper video
 let layout: Layout | undefined; // recomputed on resize and when the display's size changes (rotation)
 
 function quit() {
-	video?.stdin!.end(); // simvideo removes its frame directory when its input closes
+	video?.stdin!.end(); // simhelper video removes its frame directory when its input closes
 	hid?.kill();
 	if (bezel) rmSync(bezel.dir, { recursive: true, force: true });
 	out.write(`${ESC}[?1016l${ESC}[?1006l${ESC}[?1002l${ESC}[?1000l${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[?25h${ESC}[2J${ESC}[H`);
@@ -126,7 +126,7 @@ function place(id: number, z: number, box: Box, png: Buffer) {
 	out.write(s);
 }
 
-// A w x h RGBA frame file from simvideo, which the terminal reads and deletes (t=t).
+// A w x h RGBA frame file from simhelper video, which the terminal reads and deletes (t=t).
 function placeScreen(box: Box, w: number, h: number, path: string, written: () => void) {
 	frameNo++;
 	const head = `a=T,f=32,s=${w},v=${h},t=t,i=${SCREEN_IDS[frameNo % SCREEN_IDS.length]},p=1,c=${box.c},r=${box.r},z=${frameNo},C=1,q=2`;
@@ -138,7 +138,7 @@ function fail(msg: string) {
 	out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J${ESC}[H${label}: ${msg}\r\n(retrying)`);
 }
 
-// Lays the device out for the display's size and asks simvideo for frames that fill the screen box.
+// Lays the device out for the display's size and asks simhelper video for frames that fill the screen box.
 let laying = false;
 let again = false; // a resize or rotation arrived while laying out
 async function relayout() {
@@ -160,14 +160,14 @@ async function relayout() {
 	}
 }
 
-// simvideo sends "source <w> <h>" when it learns the display's size and "frame <w> <h> <path>" per
+// simhelper video sends "source <w> <h>" when it learns the display's size and "frame <w> <h> <path>" per
 // frame; it waits for "next" before producing another.
 function stream() {
-	helper("simvideo").then(
+	helper().then(
 		(bin) => {
 			let buf = "";
 			let err = "";
-			video = spawn(bin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
+			video = spawn(bin, ["video", udid], { stdio: ["pipe", "pipe", "pipe"] });
 			video.stdin!.on("error", () => {}); // a dead helper is reported by "close"
 			video.stdout!.on("data", (d) => {
 				buf += d;
@@ -188,18 +188,18 @@ function stream() {
 			});
 			video.stderr!.on("data", (d) => (err += d));
 			video.on("close", () => {
-				fail(err.trim().split("\n").pop() || "simvideo stopped");
+				fail(err.trim().split("\n").pop() || "simhelper video stopped");
 				setTimeout(stream, 1000);
 			});
 		},
 		(e) => {
-			fail(`couldn't build simvideo: ${(e as Error).message.split("\n")[0]}`);
+			fail(`couldn't build simhelper: ${(e as Error).message.split("\n")[0]}`);
 			setTimeout(stream, 1000);
 		},
 	);
 }
 
-// Input goes through simhid (see sim.ts), restarted a second after it stops.
+// Input goes through simhelper hid (see sim.ts), restarted a second after it stops.
 let hid: ChildProcess | undefined;
 let hidReady = false;
 let statusShown = false;
@@ -222,7 +222,7 @@ async function connectHid() {
 	hid.stderr!.on("data", (d) => (err += d));
 	hid.on("close", () => {
 		hidReady = false;
-		status(err.trim().split("\n").pop() || "simhid stopped");
+		status(err.trim().split("\n").pop() || "simhelper hid stopped");
 		setTimeout(connectHid, 1000);
 	});
 }

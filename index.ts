@@ -74,7 +74,7 @@ export default function (pi: ExtensionAPI) {
 
 	const done = (udid: string, text: string) => ({ content: [{ type: "text" as const, text }], details: { udid } });
 
-	// One simhid per simulator, started on first use and kept until pi exits; dropped if it dies.
+	// One simhelper hid per simulator, started on first use and kept until pi exits; dropped if it dies.
 	const hids = new Map<string, Promise<ChildProcess>>();
 	async function hidSend(udid: string, lines: string[]) {
 		let hid = hids.get(udid);

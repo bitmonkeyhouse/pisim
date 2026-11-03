@@ -24,7 +24,7 @@ export async function loadBezel(udid: string, shotWidth: number): Promise<Bezel>
 	const pdf = join(res, `${composite}.pdf`);
 
 	const dir = await mkdtemp(join(tmpdir(), "pisim-bezel-"));
-	const [ptW, ptH] = (await run(await helper("simvideo"), ["bezel-size", pdf])).stdout.trim().split(" ").map(Number);
+	const [ptW, ptH] = (await run(await helper(), ["bezel-size", pdf])).stdout.trim().split(" ").map(Number);
 	const pt = { w: ptW, h: ptH };
 	const scale = shotWidth / (pt.w - s.leftWidth - s.rightWidth);
 	const px = (n: number) => Math.round(n * scale);
@@ -60,12 +60,12 @@ export type BezelRender = {
 };
 
 // Renders the bezel as a PNG with the screen cut out (shape from a masked screenshot's alpha), so
-// frames drawn underneath show through; see simvideo.m.
+// frames drawn underneath show through; see simhelper.m.
 export async function renderBezel(bezel: Bezel, maskedShot: Buffer, o: BezelRender): Promise<Buffer> {
 	const file = join(bezel.dir, "bezel.png");
 	const mask = join(bezel.dir, "mask.png");
 	await writeFile(mask, maskedShot);
 	const nums = [o.w, o.h, o.canvasW, o.canvasH, o.padLeft, o.padTop, o.holeX, o.holeY, o.holeW, o.holeH].map(String);
-	await run(await helper("simvideo"), ["bezel", bezel.pdf, mask, file, ...nums, o.background]);
+	await run(await helper(), ["bezel", bezel.pdf, mask, file, ...nums, o.background]);
 	return readFile(file);
 }
