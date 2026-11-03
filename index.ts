@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { axe, describe, type Device, listBooted, screenshot } from "./sim.ts";
+import { axe, describe, type Device, listBooted, screenshot, simctl } from "./sim.ts";
 
 const run = promisify(execFile);
 const viewer = join(dirname(fileURLToPath(import.meta.url)), "viewer.ts");
@@ -125,6 +125,36 @@ export default function (pi: ExtensionAPI) {
 			const { udid } = await pick(params.device ?? "", ctx);
 			await axe("type", "--udid", udid, "--", params.text);
 			return done(udid, `Typed ${JSON.stringify(params.text)}`);
+		},
+	});
+
+	pi.registerTool({
+		name: "sim_launch",
+		label: "Simulator launch",
+		description: "Launch an installed app by bundle identifier on a booted iOS simulator; set restart to terminate a running copy first (e.g. after installing a new build).",
+		promptSnippet: "Launch an app on a booted iOS simulator",
+		parameters: Type.Object({
+			bundle_id: Type.String({ description: "App bundle identifier, e.g. com.example.app" }),
+			restart: Type.Optional(Type.Boolean({ description: "Terminate the app first if it's running" })),
+			device,
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { udid } = await pick(params.device ?? "", ctx);
+			const flags = params.restart ? ["--terminate-running-process"] : [];
+			return done(udid, (await simctl("launch", ...flags, udid, params.bundle_id)).trim());
+		},
+	});
+
+	pi.registerTool({
+		name: "sim_open_url",
+		label: "Simulator open URL",
+		description: "Open a URL (web link, deep link or custom URL scheme) on a booted iOS simulator.",
+		promptSnippet: "Open a URL or deep link on a booted iOS simulator",
+		parameters: Type.Object({ url: Type.String({ description: "URL to open, e.g. myapp://settings" }), device }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { udid } = await pick(params.device ?? "", ctx);
+			await simctl("openurl", udid, params.url);
+			return done(udid, `Opened ${params.url}`);
 		},
 	});
 }

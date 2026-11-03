@@ -28,6 +28,15 @@ export async function screenshot(udid: string): Promise<Buffer> {
 	}
 }
 
+export async function simctl(...args: string[]): Promise<string> {
+	try {
+		return (await run("xcrun", ["simctl", ...args])).stdout;
+	} catch (e) {
+		const err = e as Error & { stderr?: string };
+		throw new Error(err.stderr?.trim() || err.message);
+	}
+}
+
 export async function axe(...args: string[]): Promise<string> {
 	try {
 		// Xcode 27's dtuhidd drops input sent before it activates; AXe 1.8 needs the wait (AXe issue #71).
