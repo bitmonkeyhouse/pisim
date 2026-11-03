@@ -1,11 +1,11 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
-// clicks tap, drags swipe, typing types. Frames stream from `axe stream-video` (~18 fps); the
-// device bezel is a second image drawn on top. Ctrl-C quits.
+// clicks tap, drags swipe, typing types. Frames come from simvideo only when the display changes;
+// the device bezel is a second image drawn on top. Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { type Bezel, fits, loadBezel, renderBezel } from "./bezel.ts";
-import { keyLines, keymap, screenshot, startHid } from "./sim.ts";
+import { helper, keyLines, keymap, screenshot, startHid } from "./sim.ts";
 
 const [udid, label = udid] = process.argv.slice(2);
 if (!udid) {
@@ -21,14 +21,12 @@ const out = process.stdout;
 let cell = { w: 8, h: 16 }; // fallbacks if the terminal doesn't answer
 let background = "black";
 let bezel: Bezel | null | undefined; // null when the device has no usable bezel
-let axe: ChildProcess | undefined;
-let frame: Buffer | undefined; // latest PNG from axe
-let shown: Buffer | undefined; // last frame drawn (or skipped as identical)
-let layout: Layout | undefined; // dropped on resize, recomputed when the frame size changes (rotation)
-let busy = false;
+let video: ChildProcess | undefined;
+let source: { w: number; h: number } | undefined; // the display's size in pixels, from simvideo
+let layout: Layout | undefined; // recomputed on resize and when the display's size changes (rotation)
 
 function quit() {
-	axe?.kill();
+	video?.stdin!.end(); // simvideo removes its frame directory when its input closes
 	hid?.kill();
 	if (bezel) rmSync(bezel.dir, { recursive: true, force: true });
 	out.write(`${ESC}[?1016l${ESC}[?1006l${ESC}[?1002l${ESC}[?1000l${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[?25h${ESC}[2J${ESC}[H`);
@@ -128,63 +126,77 @@ function place(id: number, z: number, box: Box, png: Buffer) {
 	out.write(s);
 }
 
-function placeScreen(box: Box, png: Buffer) {
+// A w x h RGBA frame file from simvideo, which the terminal reads and deletes (t=t).
+function placeScreen(box: Box, w: number, h: number, path: string, written: () => void) {
 	frameNo++;
-	place(SCREEN_IDS[frameNo % SCREEN_IDS.length], frameNo, box, png);
+	const head = `a=T,f=32,s=${w},v=${h},t=t,i=${SCREEN_IDS[frameNo % SCREEN_IDS.length]},p=1,c=${box.c},r=${box.r},z=${frameNo},C=1,q=2`;
+	out.write(`${ESC}[${box.row + 1};${box.col + 1}H${ESC}_G${head};${Buffer.from(path).toString("base64")}${ESC}\\`, written);
 }
 
 function fail(msg: string) {
 	layout = undefined;
-	shown = undefined;
 	out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J${ESC}[H${label}: ${msg}\r\n(retrying)`);
 }
 
-// Draws the latest frame unless it's unchanged or the terminal is still catching up; skipped frames are just dropped.
-async function update() {
-	const f = frame;
-	if (busy || !f || f === shown || out.writableNeedDrain) return;
-	busy = true;
+// Lays the device out for the display's size and asks simvideo for frames that fill the screen box.
+let laying = false;
+let again = false; // a resize or rotation arrived while laying out
+async function relayout() {
+	if (!source) return;
+	if (laying) return void (again = true);
+	laying = true;
+	again = false;
 	try {
-		if (f.readUInt32BE(0) !== 0x89504e47) throw new Error("axe sent a frame that isn't a PNG");
-		const w = f.readUInt32BE(16);
-		const h = f.readUInt32BE(20);
-		if (layout?.w !== w || layout?.h !== h) {
-			layout = await layoutFor(w, h);
-			shown = undefined;
-			out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J`);
-			if (layout.bezel) place(2, BEZEL_Z, layout.bezel, layout.bezel.png);
-		}
-		if (!shown?.equals(f)) placeScreen(layout.screen, f);
-		shown = f;
+		const l = await layoutFor(source.w, source.h);
+		layout = l;
+		out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J`);
+		if (l.bezel) place(2, BEZEL_Z, l.bezel, l.bezel.png);
+		video?.stdin!.write(`size ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);
 	} catch (e) {
 		fail((e as Error).message);
 	} finally {
-		busy = false;
-		if (frame !== f) update();
+		laying = false;
+		if (again) relayout();
 	}
 }
 
-// axe's raw format is a stream of PNGs, each prefixed with its length as a big-endian u32.
+// simvideo sends "source <w> <h>" when it learns the display's size and "frame <w> <h> <path>" per
+// frame; it waits for "next" before producing another.
 function stream() {
-	let buf = Buffer.alloc(0);
-	let err = "";
-	axe = spawn("axe", ["stream-video", "--udid", udid, "--format", "raw", "--fps", "30"], { stdio: ["ignore", "pipe", "pipe"] });
-	axe.stdout!.on("data", (d: Buffer) => {
-		buf = Buffer.concat([buf, d]);
-		while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32BE(0)) {
-			frame = buf.subarray(4, 4 + buf.readUInt32BE(0));
-			buf = buf.subarray(4 + frame.length);
-		}
-		update();
-	});
-	axe.stderr!.on("data", (d) => (err += d));
-	axe.on("error", (e: NodeJS.ErrnoException) => {
-		err = e.code === "ENOENT" ? "AXe is not installed: brew install cameroncooke/axe/axe" : e.message;
-	});
-	axe.on("close", () => {
-		fail(err.trim().split("\n").pop() || "axe stream-video stopped");
-		setTimeout(stream, 1000);
-	});
+	helper("simvideo").then(
+		(bin) => {
+			let buf = "";
+			let err = "";
+			video = spawn(bin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
+			video.stdin!.on("error", () => {}); // a dead helper is reported by "close"
+			video.stdout!.on("data", (d) => {
+				buf += d;
+				for (let i; (i = buf.indexOf("\n")) >= 0; buf = buf.slice(i + 1)) {
+					const line = buf.slice(0, i);
+					const src = /^source (\d+) (\d+)$/.exec(line);
+					const frame = /^frame (\d+) (\d+) (.+)$/.exec(line);
+					if (src) {
+						source = { w: Number(src[1]), h: Number(src[2]) };
+						relayout();
+					} else if (frame && layout) {
+						placeScreen(layout.screen, Number(frame[1]), Number(frame[2]), frame[3], () => video?.stdin!.write("next\n"));
+					} else if (frame) {
+						rmSync(frame[3], { force: true }); // no layout yet to draw it in
+						video.stdin!.write("next\n");
+					}
+				}
+			});
+			video.stderr!.on("data", (d) => (err += d));
+			video.on("close", () => {
+				fail(err.trim().split("\n").pop() || "simvideo stopped");
+				setTimeout(stream, 1000);
+			});
+		},
+		(e) => {
+			fail(`couldn't build simvideo: ${(e as Error).message.split("\n")[0]}`);
+			setTimeout(stream, 1000);
+		},
+	);
 }
 
 // Input goes through simhid (see sim.ts), restarted a second after it stops.
@@ -259,12 +271,7 @@ process.stdin.setRawMode(true);
 process.stdin.resume();
 await queryTerminal();
 process.stdin.on("data", onInput);
-out.on("drain", update);
-out.on("resize", () => {
-	layout = undefined;
-	shown = undefined;
-	update();
-});
+out.on("resize", relayout);
 process.on("SIGTERM", quit);
 process.on("SIGHUP", quit);
 // Mouse reporting: 1000 press/release, 1002 drags, 1006 SGR encoding, 1016 positions in pixels.

@@ -83,20 +83,28 @@ export async function describe(udid: string): Promise<string> {
 	return lines.join("\n");
 }
 
-// simhid (simhid.m) sends touches and keys over one connection kept open to the simulator; a fresh
-// connection per event costs ~0.5s. Built with clang when missing or older than its source.
-const helperSrc = join(dirname(fileURLToPath(import.meta.url)), "simhid.m");
-const helperBin = helperSrc.replace(/\.m$/, "");
+// Native helpers, built with clang when missing or older than their source:
+// simhid (simhid.m) sends touches and keys over one connection kept open to the simulator (a fresh
+// connection per event costs ~0.5s); simvideo (simvideo.m) streams the display when it changes.
+const here = dirname(fileURLToPath(import.meta.url));
+const frameworks = { simhid: ["Foundation"], simvideo: ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders"] };
+
+export async function helper(name: keyof typeof frameworks): Promise<string> {
+	const src = join(here, `${name}.m`);
+	const bin = join(here, name);
+	if (!existsSync(bin) || statSync(bin).mtimeMs < statSync(src).mtimeMs) {
+		await run("clang", ["-fobjc-arc", ...frameworks[name].flatMap((f) => ["-framework", f]), src, "-o", bin]);
+	}
+	return bin;
+}
 
 // Starts simhid for a simulator, resolving once it's connected. Write lines to its stdin:
 // "down|move|up <x> <y>" (fractions of the screen) or "key <usage> down|up".
 export async function startHid(udid: string): Promise<ChildProcess> {
-	if (!existsSync(helperBin) || statSync(helperBin).mtimeMs < statSync(helperSrc).mtimeMs) {
-		await run("clang", ["-fobjc-arc", "-framework", "Foundation", helperSrc, "-o", helperBin]);
-	}
+	const bin = await helper("simhid");
 	return new Promise((resolve, reject) => {
 		let err = "";
-		const p = spawn(helperBin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
+		const p = spawn(bin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
 		p.stdin!.on("error", () => {}); // a dead helper is reported by "close"
 		p.stderr!.on("data", (d) => (err += d));
 		p.stdout!.once("data", () => resolve(p));
