@@ -1,10 +1,11 @@
-// Shows a simulator in the current terminal pane via the Kitty graphics protocol.
-// Frames stream from `axe stream-video` (~18 fps); the device bezel is a second image drawn on top.
+// Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
+// clicks tap, drags swipe, typing types. Frames stream from `axe stream-video` (~18 fps); the
+// device bezel is a second image drawn on top. Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { type Bezel, fits, loadBezel, renderBezel } from "./bezel.ts";
-import { screenshot } from "./sim.ts";
+import { axe as runAxe, screenshot } from "./sim.ts";
 
 const [udid, label = udid] = process.argv.slice(2);
 if (!udid) {
@@ -29,7 +30,7 @@ let busy = false;
 function quit() {
 	axe?.kill();
 	if (bezel) rmSync(bezel.dir, { recursive: true, force: true });
-	out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[?25h${ESC}[2J${ESC}[H`);
+	out.write(`${ESC}[?1016l${ESC}[?1006l${ESC}[?1000l${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[?25h${ESC}[2J${ESC}[H`);
 	process.exit(0);
 }
 
@@ -185,12 +186,109 @@ function stream() {
 	});
 }
 
+// Device screen size in points (what axe taps in), from the accessibility tree's root frame.
+let points: { key: string; w: number; h: number } | undefined;
+async function screenPoints() {
+	const key = `${layout?.w}x${layout?.h}`;
+	if (points?.key !== key) {
+		const [root] = JSON.parse(await runAxe("describe-ui", "--udid", udid));
+		points = { key, w: root.frame.width, h: root.frame.height };
+	}
+	return points;
+}
+
+// Input becomes `axe batch` steps, run in order. A batch shares one simulator HID session: separate
+// axe commands each pay AXe's ~0.5s Xcode 27 wait, and a key sent right after another command can
+// be dropped. Typing collects until it pauses; a click or drag sends everything at once.
+type Step = (pts: { w: number; h: number }) => string;
+let steps: Step[] = [];
+let typed = "";
+let typingTimer: NodeJS.Timeout | undefined;
+let running = false;
+let errorShown = false;
+
+function takeTyped() {
+	clearTimeout(typingTimer);
+	const t = typed;
+	if (t) steps.push(() => `type "${t.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`);
+	typed = "";
+}
+
+async function run() {
+	if (running || !steps.length) return;
+	running = true;
+	const batch = steps;
+	steps = [];
+	try {
+		const pts = await screenPoints();
+		await runAxe("batch", "--udid", udid, ...batch.flatMap((s) => ["--step", s(pts)]));
+		if (errorShown) out.write(`${ESC}[1;1H${ESC}[2K`);
+		errorShown = false;
+	} catch (e) {
+		out.write(`${ESC}[1;1H${ESC}[2K${(e as Error).message.split("\n")[0]}`);
+		errorShown = true;
+	} finally {
+		running = false;
+		run();
+	}
+}
+
+const flush = () => {
+	takeTyped();
+	run();
+};
+
+// Mouse position (1-based pane pixels from SGR pixel mode) as a fraction of the screen, if it's on it.
+function onScreen(x: number, y: number, clamp = false) {
+	const s = layout?.screen;
+	if (!s) return;
+	let fx = (x - 1 - s.col * cell.w) / (s.c * cell.w);
+	let fy = (y - 1 - s.row * cell.h) / (s.r * cell.h);
+	if (clamp) [fx, fy] = [Math.min(1, Math.max(0, fx)), Math.min(1, Math.max(0, fy))];
+	return fx >= 0 && fx <= 1 && fy >= 0 && fy <= 1 ? { fx, fy } : undefined;
+}
+
+let press: { x: number; y: number; t: number } | undefined;
+function onMouse(button: number, x: number, y: number, released: boolean) {
+	if (button === 0 && !released) press = { x, y, t: Date.now() };
+	if (!released || !press) return;
+	const start = onScreen(press.x, press.y);
+	const end = onScreen(x, y, true)!;
+	const moved = Math.hypot(x - press.x, y - press.y);
+	const seconds = Math.min(1.5, Math.max(0.1, (Date.now() - press.t) / 1000)).toFixed(2);
+	press = undefined;
+	if (!start) return;
+	takeTyped();
+	// shortcut: a held click is a plain tap and a drag is a straight swipe; no long-press or curved paths.
+	steps.push(({ w, h }) => {
+		const [sx, sy, ex, ey] = [start.fx * w, start.fy * h, end.fx * w, end.fy * h].map((n) => n.toFixed(1));
+		return moved < 8 ? `tap -x ${sx} -y ${sy}` : `swipe --start-x ${sx} --start-y ${sy} --end-x ${ex} --end-y ${ey} --duration ${seconds}`;
+	});
+	run();
+}
+
+// Printable keys are typed as text; these go as HID keycodes.
+const KEYS: Record<string, string> = { "\r": "40", "\x7f": "42", "\t": "43", "\x1b[A": "82", "\x1b[B": "81", "\x1b[D": "80", "\x1b[C": "79" };
+
+function onInput(d: Buffer) {
+	for (const [tok, b, x, y, kind] of d.toString("latin1").matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])|\x1b\[[ABCD]|[\s\S]/g)) {
+		if (kind) onMouse(Number(b), Number(x), Number(y), kind === "m");
+		else if (tok === "\x03") quit();
+		else if (KEYS[tok] || (tok >= " " && tok <= "~")) {
+			if (KEYS[tok]) {
+				takeTyped();
+				steps.push(() => `key ${KEYS[tok]}`);
+			} else typed += tok;
+			clearTimeout(typingTimer);
+			typingTimer = setTimeout(flush, 150);
+		}
+	}
+}
+
 process.stdin.setRawMode(true);
 process.stdin.resume();
 await queryTerminal();
-process.stdin.on("data", (d) => {
-	if (d[0] === 0x71 || d[0] === 0x03) quit(); // q or ctrl-c
-});
+process.stdin.on("data", onInput);
 out.on("drain", update);
 out.on("resize", () => {
 	layout = undefined;
@@ -199,5 +297,6 @@ out.on("resize", () => {
 });
 process.on("SIGTERM", quit);
 process.on("SIGHUP", quit);
-out.write(`${ESC}[?25l${ESC}[2J`);
+// Mouse reporting: 1000 press/release, 1006 SGR encoding, 1016 positions in pixels.
+out.write(`${ESC}[?25l${ESC}[2J${ESC}[?1000h${ESC}[?1006h${ESC}[?1016h`);
 stream();
