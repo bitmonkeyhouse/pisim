@@ -32,18 +32,18 @@ pi install git:github.com/bitmonkeyhouse/pisim
 
 ## The viewer
 
-Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`). With several booted and no name given, pisim asks which one. It splits your herdr pane and shows the simulator on the right at its real physical size, as Simulator.app's Physical Size, worked out from the dimensions of the display the terminal is on; move the window to another display and it resizes to match. If the pane is too small for that, the device shrinks to fit. When the device turns or a foldable opens and no longer fits, the pane widens, and goes back to its old width once the device fits again (unless you've resized it yourself in between, or zoomed with Ctrl-Y `z`).
+Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`). With several booted and no name given, pisim asks which one. It splits your herdr pane and shows the simulator on the right at its real physical size, as Simulator.app's Physical Size, worked out from the dimensions of the display the terminal is on; move the window to another display and it resizes to match. If the pane is too small for that, the device shrinks to fit. When the device turns or a foldable opens and no longer fits, the pane widens, and goes back to its old width once the device fits again (unless you've resized it yourself in between, or zoomed with ctrl-y `z`).
 
 | In the pane | Does |
 |---|---|
 | Click | Tap |
 | Drag | Swipe or scroll; long-presses and flicks work too |
 | Type | Types into the focused field; Enter, Backspace, Tab, Esc and arrows work |
-| Ctrl-Y, then `h` / `l` / `s` / `+` / `-` | Home, Lock (again to wake), Siri, volume up / down |
-| Ctrl-Y, then `r` or `→` / `←` | Rotate the device clockwise / anticlockwise |
-| Ctrl-Y, then `z` | Zoom to fill the pane, or back to actual size |
-| Ctrl-Y, then `o` / `c` / `p` / `f` | On a foldable (iPhone Duo): open, close, half-fold, or toggle open and closed |
-| Ctrl-C | Close the pane |
+| ctrl-y, then `h` / `l` / `s` / `+` / `-` | Home, Lock (again to wake), Siri, volume up / down |
+| ctrl-y, then `r` or `→` / `←` | Rotate the device clockwise / anticlockwise |
+| ctrl-y, then `z` | Zoom to fill the pane, or back to actual size |
+| ctrl-y, then `o` / `c` / `p` / `f` | On a foldable (iPhone Duo): open, close, half-fold, or toggle open and closed |
+| ctrl-y, then `q`, or ctrl-c | Close the pane |
 
 Click the pane first so it has your keyboard. The scroll wheel goes to herdr, not the simulator, so drag to scroll. Typing follows the simulator's hardware keyboard layout: US, or British for `en_GB` simulators.
 

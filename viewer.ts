@@ -1,8 +1,8 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
 // clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
-// the device bezel is a second image drawn on top. Ctrl-Y then h/l/s/+/- presses Home, Lock, Siri or
+// the device bezel is a second image drawn on top. ctrl-y then h/l/s/+/- presses Home, Lock, Siri or
 // volume up/down, r or the arrows rotate the device, z zooms to fill the pane, and on a foldable
-// o/c/p open, close or half-fold it and f toggles open and closed; Ctrl-C quits. The herdr pane widens
+// o/c/p open, close or half-fold it and f toggles open and closed; q or Ctrl-C quits. The herdr pane widens
 // when a turned or opened device needs it (fitPane).
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, execFile, spawn } from "node:child_process";
@@ -318,7 +318,7 @@ let hidReady = false;
 let statusShown = false;
 
 function status(msg?: string) {
-	if (msg || statusShown) out.write(`${ESC}[1;1H${ESC}[2K${msg ?? ""}`);
+	if (msg || statusShown) out.write(`${ESC}[1;1H${ESC}[2K${(msg ?? "").slice(0, out.columns)}`); // one row, which is all it clears
 	statusShown = !!msg;
 }
 
@@ -375,7 +375,7 @@ let keys = new Map<string, number[]>();
 keymap(udid).then((k) => (keys = k));
 const press = (k: number[]) => keyLines(k).forEach(send);
 
-// Ctrl-Y then a key presses a hardware button, rotates, zooms or (on a foldable) folds the device;
+// ctrl-y then a key presses a hardware button, rotates, zooms or (on a foldable) folds the device;
 // any other key cancels.
 const BUTTON_KEYS: Record<string, Button> = { h: "home", l: "lock", s: "siri", "+": "volume-up", "-": "volume-down" };
 const ROTATE_KEYS: Record<string, number> = { r: 1, "\x1b[C": 1, "\x1b[D": -1 }; // r and → clockwise, ← anticlockwise
@@ -402,11 +402,12 @@ function onInput(d: Buffer) {
 			else if (key === "z") {
 				zoom = !zoom;
 				relayout();
-			} else if (foldable && key in FOLD_KEYS) send(`hinge ${FOLD_KEYS[key]}`);
+			} else if (key === "q") quit();
+			else if (foldable && key in FOLD_KEYS) send(`hinge ${FOLD_KEYS[key]}`);
 			else if (foldable && key === "f") send(`hinge ${open ? 0 : 180}`);
 		} else if (tok === "\x19") {
 			buttonPrefix = true;
-			status(`h home l lock s siri +/- vol r/←/→ rotate z zoom${foldable ? " o/c/p/f fold" : ""}`);
+			status(`h home l lock s siri +/- vol r rotate z zoom${foldable ? " o/c/p/f fold" : ""} q close`);
 		} else if (keys.has(tok)) press(keys.get(tok)!);
 	}
 }

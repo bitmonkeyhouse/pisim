@@ -43,7 +43,7 @@ export default function (pi: ExtensionAPI) {
 				current = device;
 				const { stdout } = await run("herdr", ["pane", "split", self, "--direction", "right", "--ratio", "0.6"]);
 				const pane = JSON.parse(stdout).result.pane.pane_id as string;
-				await run("herdr", ["pane", "rename", pane, device.name]);
+				await run("herdr", ["pane", "rename", pane, `${device.name} (ctrl-y for menu)`]);
 				const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`;
 				await run("herdr", ["pane", "run", pane, `exec ${q(process.execPath)} ${q(viewer)} ${device.udid} ${q(device.name)}`]);
 			} catch (e) {
