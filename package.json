@@ -1,6 +1,22 @@
 {
-  "name": "pisim",
-  "private": true,
+  "name": "@bitmonkey/pisim",
+  "version": "0.10.0",
+  "description": "Pi extension: watch and drive a booted iOS Simulator from a herdr pane, and let the agent see, tap and type into it",
+  "keywords": ["pi-package", "pi", "ios", "simulator", "xcode", "herdr"],
+  "license": "MIT",
+  "author": "Bit Monkey Ltd",
+  "homepage": "https://github.com/bitmonkeyhouse/pisim#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/bitmonkeyhouse/pisim.git" },
+  "bugs": { "url": "https://github.com/bitmonkeyhouse/pisim/issues" },
   "type": "module",
-  "pi": { "extensions": ["./index.ts"] }
+  "os": ["darwin"],
+  "engines": { "node": ">=22.19.0" },
+  "files": ["index.ts", "sim.ts", "viewer.ts", "bezel.ts", "simhelper.m", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "publishConfig": { "access": "public" }
 }
