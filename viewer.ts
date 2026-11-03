@@ -2,15 +2,10 @@
 // clicks tap, drags swipe, typing types. Frames stream from `axe stream-video` (~18 fps); the
 // device bezel is a second image drawn on top. Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
-import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { existsSync, rmSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { type ChildProcess, spawn } from "node:child_process";
+import { rmSync } from "node:fs";
 import { type Bezel, fits, loadBezel, renderBezel } from "./bezel.ts";
-import { screenshot } from "./sim.ts";
-
-const run = promisify(execFile);
+import { keyLines, keymap, screenshot, startHid } from "./sim.ts";
 
 const [udid, label = udid] = process.argv.slice(2);
 if (!udid) {
@@ -192,10 +187,7 @@ function stream() {
 	});
 }
 
-// Input goes through simhid, which keeps one HID connection to the simulator open: a fresh
-// connection per event (as with axe) costs ~0.5s. Built from simhid.m on first use.
-const helperSrc = join(dirname(fileURLToPath(import.meta.url)), "simhid.m");
-const helperBin = helperSrc.replace(/\.m$/, "");
+// Input goes through simhid (see sim.ts), restarted a second after it stops.
 let hid: ChildProcess | undefined;
 let hidReady = false;
 let statusShown = false;
@@ -205,26 +197,21 @@ function status(msg?: string) {
 	statusShown = !!msg;
 }
 
-async function startHid() {
+async function connectHid() {
 	try {
-		if (!existsSync(helperBin) || statSync(helperBin).mtimeMs < statSync(helperSrc).mtimeMs) {
-			await run("clang", ["-fobjc-arc", "-framework", "Foundation", helperSrc, "-o", helperBin]);
-		}
+		hid = await startHid(udid);
 	} catch (e) {
-		return status(`couldn't build simhid: ${(e as Error).message.split("\n")[0]}`);
+		status((e as Error).message.split("\n")[0]);
+		return setTimeout(connectHid, 1000);
 	}
+	hidReady = true;
+	status();
 	let err = "";
-	hid = spawn(helperBin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
-	hid.stdin!.on("error", () => {}); // a dead helper is reported by "close"
-	hid.stdout!.once("data", () => {
-		hidReady = true;
-		status();
-	});
 	hid.stderr!.on("data", (d) => (err += d));
 	hid.on("close", () => {
 		hidReady = false;
 		status(err.trim().split("\n").pop() || "simhid stopped");
-		setTimeout(startHid, 1000);
+		setTimeout(connectHid, 1000);
 	});
 }
 
@@ -256,39 +243,15 @@ function onMouse(button: number, x: number, y: number, released: boolean) {
 	} else if (button === 32 && touching) send(`move ${at}`);
 }
 
-// Characters to HID usages with the modifiers held for them. US layout: the character at index i
-// is usage 4 + i, unshifted then shifted ("\0" = none).
-const SHIFT = 225;
-const ALT = 226;
-const KEYS = new Map<string, number[]>(); // char -> [...modifiers, usage]
-[..."abcdefghijklmnopqrstuvwxyz1234567890\r\x1b\x7f\t -=[]\\\0;'`,./"].forEach((c, i) => KEYS.set(c, [4 + i]));
-[..."ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\0\0\0\0\0_+{}|\0:\"~<>?"].forEach((c, i) => KEYS.set(c, [SHIFT, 4 + i]));
-for (const [seq, usage] of [["\x1b[C", 79], ["\x1b[D", 80], ["\x1b[B", 81], ["\x1b[A", 82]] as const) KEYS.set(seq, [usage]);
-KEYS.delete("\0");
-// The simulator types with its own hardware keyboard layout, and en_GB simulators use British:
-// Shift+3 is £, # is Option+3, and § ± are on the ISO key by left Shift (usage 100).
-// shortcut: only US and British are mapped; other layouts type the wrong punctuation, upgrade by reading
-// the simulator's hardware keyboard layout setting.
-run("xcrun", ["simctl", "spawn", udid, "defaults", "read", "-g", "AppleLocale"]).then(
-	({ stdout }) => {
-		if (!stdout.includes("_GB")) return;
-		for (const [c, keys] of [["£", [SHIFT, 32]], ["#", [ALT, 32]], ["§", [100]], ["±", [SHIFT, 100]]] as const) {
-			KEYS.set(c, [...keys]);
-		}
-	},
-	() => {},
-);
-
-function press(keys: number[]) {
-	for (const k of keys) send(`key ${k} down`);
-	for (const k of keys.toReversed()) send(`key ${k} up`);
-}
+let keys = new Map<string, number[]>();
+keymap(udid).then((k) => (keys = k));
+const press = (k: number[]) => keyLines(k).forEach(send);
 
 function onInput(d: Buffer) {
 	for (const [tok, b, x, y, kind] of d.toString().matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])|\x1b\[[ABCD]|[\s\S]/g)) {
 		if (kind) onMouse(Number(b), Number(x), Number(y), kind === "m");
 		else if (tok === "\x03") quit();
-		else if (KEYS.has(tok)) press(KEYS.get(tok)!);
+		else if (keys.has(tok)) press(keys.get(tok)!);
 	}
 }
 
@@ -307,4 +270,4 @@ process.on("SIGHUP", quit);
 // Mouse reporting: 1000 press/release, 1002 drags, 1006 SGR encoding, 1016 positions in pixels.
 out.write(`${ESC}[?25l${ESC}[2J${ESC}[?1000h${ESC}[?1002h${ESC}[?1006h${ESC}[?1016h`);
 stream();
-startHid();
+connectHid();

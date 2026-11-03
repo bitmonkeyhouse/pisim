@@ -1,7 +1,9 @@
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -39,8 +41,7 @@ export async function simctl(...args: string[]): Promise<string> {
 
 export async function axe(...args: string[]): Promise<string> {
 	try {
-		// Xcode 27's dtuhidd drops input sent before it activates; AXe 1.8 needs the wait (AXe issue #71).
-		return (await run("axe", args, { env: { ...process.env, AXE_HID_STABILIZATION_MS: "500" } })).stdout;
+		return (await run("axe", args, { maxBuffer: 16 << 20 })).stdout;
 	} catch (e) {
 		const err = e as NodeJS.ErrnoException & { stderr?: string };
 		if (err.code === "ENOENT") throw new Error("AXe is not installed: brew install cameroncooke/axe/axe");
@@ -48,7 +49,7 @@ export async function axe(...args: string[]): Promise<string> {
 	}
 }
 
-type AXNode = {
+export type AXNode = {
 	type: string;
 	AXLabel?: string | null;
 	AXUniqueId?: string | null;
@@ -57,6 +58,9 @@ type AXNode = {
 	frame?: { x: number; y: number; width: number; height: number };
 	children?: AXNode[];
 };
+
+// The accessibility tree, in points from the top-left; the first root is the app on screen.
+export const uiTree = async (udid: string) => JSON.parse(await axe("describe-ui", "--udid", udid)) as AXNode[];
 
 // `axe describe-ui` is ~80KB of JSON; condense to one line per labelled element, nested by depth.
 export async function describe(udid: string): Promise<string> {
@@ -75,6 +79,52 @@ export async function describe(udid: string): Promise<string> {
 		}
 		for (const c of n.children ?? []) walk(c, named ? depth + 1 : depth);
 	};
-	for (const n of JSON.parse(await axe("describe-ui", "--udid", udid)) as AXNode[]) walk(n, 0);
+	for (const n of await uiTree(udid)) walk(n, 0);
 	return lines.join("\n");
 }
+
+// simhid (simhid.m) sends touches and keys over one connection kept open to the simulator; a fresh
+// connection per event costs ~0.5s. Built with clang when missing or older than its source.
+const helperSrc = join(dirname(fileURLToPath(import.meta.url)), "simhid.m");
+const helperBin = helperSrc.replace(/\.m$/, "");
+
+// Starts simhid for a simulator, resolving once it's connected. Write lines to its stdin:
+// "down|move|up <x> <y>" (fractions of the screen) or "key <usage> down|up".
+export async function startHid(udid: string): Promise<ChildProcess> {
+	if (!existsSync(helperBin) || statSync(helperBin).mtimeMs < statSync(helperSrc).mtimeMs) {
+		await run("clang", ["-fobjc-arc", "-framework", "Foundation", helperSrc, "-o", helperBin]);
+	}
+	return new Promise((resolve, reject) => {
+		let err = "";
+		const p = spawn(helperBin, [udid], { stdio: ["pipe", "pipe", "pipe"] });
+		p.stdin!.on("error", () => {}); // a dead helper is reported by "close"
+		p.stderr!.on("data", (d) => (err += d));
+		p.stdout!.once("data", () => resolve(p));
+		p.on("close", () => reject(new Error(err.trim().split("\n").pop() || "simhid exited")));
+	});
+}
+
+const SHIFT = 225;
+const ALT = 226;
+
+// Characters (and arrow-key escape sequences) to HID usages with the modifiers held for them.
+// US layout: the character at index i is usage 4 + i, unshifted then shifted ("\0" = none).
+export async function keymap(udid: string): Promise<Map<string, number[]>> {
+	const keys = new Map<string, number[]>(); // char -> [...modifiers, usage]
+	[..."abcdefghijklmnopqrstuvwxyz1234567890\r\x1b\x7f\t -=[]\\\0;'`,./"].forEach((c, i) => keys.set(c, [4 + i]));
+	[..."ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\0\0\0\0\0_+{}|\0:\"~<>?"].forEach((c, i) => keys.set(c, [SHIFT, 4 + i]));
+	for (const [seq, usage] of [["\x1b[C", 79], ["\x1b[D", 80], ["\x1b[B", 81], ["\x1b[A", 82], ["\n", 40]] as const) keys.set(seq, [usage]);
+	keys.delete("\0");
+	// The simulator types with its own hardware keyboard layout, and en_GB simulators use British:
+	// Shift+3 is £, # is Option+3, and § ± are on the ISO key by left Shift (usage 100).
+	// shortcut: only US and British are mapped; other layouts type the wrong punctuation, upgrade by reading
+	// the simulator's hardware keyboard layout setting.
+	const locale = await simctl("spawn", udid, "defaults", "read", "-g", "AppleLocale").catch(() => "");
+	if (locale.includes("_GB")) {
+		for (const [c, k] of [["£", [SHIFT, 32]], ["#", [ALT, 32]], ["§", [100]], ["±", [SHIFT, 100]]] as const) keys.set(c, [...k]);
+	}
+	return keys;
+}
+
+// simhid lines that press and release a key with its modifiers.
+export const keyLines = (keys: number[]) => [...keys.map((k) => `key ${k} down`), ...keys.toReversed().map((k) => `key ${k} up`)];

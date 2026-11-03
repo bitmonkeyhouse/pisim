@@ -1,10 +1,10 @@
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { axe, describe, type Device, listBooted, screenshot, simctl } from "./sim.ts";
+import { type AXNode, describe, type Device, keyLines, keymap, listBooted, screenshot, simctl, startHid, uiTree } from "./sim.ts";
 
 const run = promisify(execFile);
 const viewer = join(dirname(fileURLToPath(import.meta.url)), "viewer.ts");
@@ -74,6 +74,49 @@ export default function (pi: ExtensionAPI) {
 
 	const done = (udid: string, text: string) => ({ content: [{ type: "text" as const, text }], details: { udid } });
 
+	// One simhid per simulator, started on first use and kept until pi exits; dropped if it dies.
+	const hids = new Map<string, Promise<ChildProcess>>();
+	async function hidSend(udid: string, lines: string[]) {
+		let hid = hids.get(udid);
+		if (!hid) {
+			hid = startHid(udid);
+			hids.set(udid, hid);
+			hid.then((p) => p.on("close", () => hids.delete(udid)), () => hids.delete(udid));
+		}
+		(await hid).stdin!.write(lines.map((l) => `${l}\n`).join(""));
+	}
+	pi.on("session_shutdown", () => {
+		for (const hid of hids.values()) hid.then((p) => p.kill(), () => {});
+	});
+	const keymaps = new Map<string, ReturnType<typeof keymap>>();
+
+	// Where to tap, as fractions of the screen: the given point, or the centre of the element with the
+	// label (or id), polling the accessibility tree for up to 3s for it to appear.
+	async function tapPoint(udid: string, t: { label?: string; id?: string; x?: number; y?: number }) {
+		for (const deadline = Date.now() + 3000; ; ) {
+			const roots = await uiTree(udid);
+			const screen = roots[0]?.frame;
+			if (!screen) throw new Error("Couldn't read the screen size from the accessibility tree");
+			if (t.x !== undefined && t.y !== undefined) return [t.x / screen.width, t.y / screen.height];
+			const found = new Map<string, NonNullable<AXNode["frame"]>>(); // by frame, as elements can repeat
+			const walk = (n: AXNode) => {
+				if (n.frame && (t.label !== undefined ? n.AXLabel === t.label : n.AXUniqueId === t.id)) found.set(JSON.stringify(n.frame), n.frame);
+				n.children?.forEach(walk);
+			};
+			roots.forEach(walk);
+			const what = t.label !== undefined ? `label "${t.label}"` : `id "${t.id}"`;
+			// Matches nested inside one of them (a button and its icon and text) are the same control.
+			const frames = [...found.values()];
+			const contains = (a: (typeof frames)[0], b: (typeof frames)[0]) =>
+				a.x <= b.x && a.y <= b.y && a.x + a.width >= b.x + b.width && a.y + a.height >= b.y + b.height;
+			const f = frames.find((a) => frames.every((b) => contains(a, b)));
+			if (frames.length && !f) throw new Error(`${frames.length} separate elements have ${what}; tap by x,y instead (see sim_describe)`);
+			if (f) return [(f.x + f.width / 2) / screen.width, (f.y + f.height / 2) / screen.height];
+			if (Date.now() > deadline) throw new Error(`No element with ${what} on screen`);
+			await new Promise((r) => setTimeout(r, 250));
+		}
+	}
+
 	pi.registerTool({
 		name: "sim_describe",
 		label: "Simulator UI",
@@ -103,27 +146,28 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const { label: l, id, x, y } = params;
-			const target =
-				x !== undefined && y !== undefined ? ["-x", String(x), "-y", String(y)]
-				: l ? ["--label", l, "--wait-timeout", "3"]
-				: id ? ["--id", id, "--wait-timeout", "3"]
-				: undefined;
-			if (!target) throw new Error("sim_tap needs label, id, or both x and y");
+			if ((x === undefined || y === undefined) && l === undefined && id === undefined) throw new Error("sim_tap needs label, id, or both x and y");
 			const { udid } = await pick(params.device ?? "", ctx);
-			await axe("tap", ...target, "--udid", udid);
-			return done(udid, `Tapped ${l ? `"${l}"` : id ? `id=${id}` : `${x},${y}`}`);
+			const at = (await tapPoint(udid, params)).map((n) => n.toFixed(4)).join(" ");
+			await hidSend(udid, [`down ${at}`, `up ${at}`]);
+			return done(udid, `Tapped ${x !== undefined && y !== undefined ? `${x},${y}` : l !== undefined ? `"${l}"` : `id=${id}`}`);
 		},
 	});
 
 	pi.registerTool({
 		name: "sim_type",
 		label: "Simulator type",
-		description: "Type text into the focused field of a booted iOS simulator (tap the field first). US keyboard characters only.",
+		description:
+			"Type text into the focused field of a booted iOS simulator (tap the field first). Newlines press Return. Only characters on the simulator's hardware keyboard layout (US or British) can be typed.",
 		promptSnippet: "Type text into a booted iOS simulator",
 		parameters: Type.Object({ text: Type.String({ description: "Text to type" }), device }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const { udid } = await pick(params.device ?? "", ctx);
-			await axe("type", "--udid", udid, "--", params.text);
+			if (!keymaps.has(udid)) keymaps.set(udid, keymap(udid));
+			const keys = await keymaps.get(udid)!;
+			const missing = [...new Set([...params.text].filter((c) => !keys.has(c)))];
+			if (missing.length) throw new Error(`Can't type ${missing.map((c) => JSON.stringify(c)).join(", ")} on the simulator's keyboard layout`);
+			await hidSend(udid, [...params.text].flatMap((c) => keyLines(keys.get(c)!)));
 			return done(udid, `Typed ${JSON.stringify(params.text)}`);
 		},
 	});
