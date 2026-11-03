@@ -242,10 +242,10 @@ function place(id: number, z: number, box: Box, png: Buffer) {
 	out.write(s);
 }
 
-// A w x h RGBA frame file from simhelper video, which the terminal reads and deletes (t=t).
+// A w x h RGB frame file from simhelper video, which the terminal reads and deletes (t=t).
 function placeScreen(box: Box, w: number, h: number, path: string, written: () => void) {
 	frameNo++;
-	const head = `a=T,f=32,s=${w},v=${h},t=t,i=${SCREEN_IDS[frameNo % SCREEN_IDS.length]},p=1,c=${box.c},r=${box.r},z=${frameNo},C=1,q=2`;
+	const head = `a=T,f=24,s=${w},v=${h},t=t,i=${SCREEN_IDS[frameNo % SCREEN_IDS.length]},p=1,c=${box.c},r=${box.r},z=${frameNo},C=1,q=2`;
 	out.write(`${ESC}[${box.row + 1};${box.col + 1}H${ESC}_G${head};${Buffer.from(path).toString("base64")}${ESC}\\`, written);
 }
 

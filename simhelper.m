@@ -14,7 +14,7 @@
 //   activate; this pays it once.
 //
 // simhelper video <udid> [<terminal pid>...]
-//   Streams the main display as raw RGBA frames, only when it changes. stdin, one command per line:
+//   Streams the main display as raw RGB frames, only when it changes. stdin, one command per line:
 //     rotate <0-3>   turn frames clockwise by that many quarter turns, to match a rotated device
 //                    (the display buffer stays portrait); nothing is sent until the next size
 //     size <w> <h>   deliver frames scaled to w x h pixels, after any rotation (nothing is sent until
@@ -24,12 +24,12 @@
 //     foldable               first, if the device has two main displays (an iPhone Duo)
 //     source <w> <h> <turn>  the display buffer's size in pixels and the clockwise quarter turns its
 //                            picture needs to be upright, at start and whenever the display changes
-//     frame <w> <h> <path>   a w x h RGBA file; the reader (the terminal, via Kitty's t=t) deletes it
+//     frame <w> <h> <path>   a w x h RGB file; the reader (the terminal, via Kitty's t=t) deletes it
 //     ppi <n>                pixels per inch of the display showing the terminal (the frontmost
 //                            window of the given apps), at start and whenever it changes
 //   At most one frame is in flight: after "frame", nothing more is sent until "next". The GPU scales
 //   the display surface (wrapped as a Metal texture, no copy) into an RGBA texture; the CPU only
-//   reads that back, and turns it if the device is rotated.
+//   reads that back, turns it if the device is rotated, and drops the alpha byte.
 //
 // simhelper describe <udid>
 //   Prints the frontmost app's accessibility tree as JSON: an array holding the app element, each
@@ -424,7 +424,7 @@ static id<MTLDevice> gpu;
 static id<MTLCommandQueue> gpuQueue;
 static MPSImageLanczosScale *scaler;
 static id<MTLTexture> srcTex, outTex;
-static void *pixels, *turned;
+static void *pixels, *turned, *rgb;
 
 static void setSurface(IOSurfaceRef s) {
 	if (surface) CFRelease(surface);
@@ -433,7 +433,7 @@ static void setSurface(IOSurfaceRef s) {
 	dirty = true;
 }
 
-// Scales the current surface into an RGBA file and hands it over, if one is due.
+// Scales the current surface into an RGB file and hands it over, if one is due.
 static void deliver(void) {
 	if (!surface || !dirty || !wanted) return;
 	size_t w = IOSurfaceGetWidth(surface), h = IOSurfaceGetHeight(surface);
@@ -464,11 +464,14 @@ static void deliver(void) {
 		vImageRotate90_ARGB8888(&from, &to, clockwise[quarter], clear, kvImageNoFlags);
 		data = turned;
 	}
+	// Without the alpha byte (the display is opaque): a quarter less for herdr to send remote clients.
+	vImage_Buffer from = { data, outH, outW, outW * 4 }, to = { rgb, outH, outW, outW * 3 };
+	vImageConvert_RGBA8888toRGB888(&from, &to, kvImageNoFlags);
 
 	// Kitty's t=t: the terminal deletes the file once read, if it's in a temp dir and named like this.
-	NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"tty-graphics-protocol-%lu.rgba", frameNo++]];
+	NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"tty-graphics-protocol-%lu.rgb", frameNo++]];
 	FILE *f = fopen(path.fileSystemRepresentation, "wb");
-	if (!f || fwrite(data, 1, outW * outH * 4, f) != outW * outH * 4) fail(@"couldn't write a frame");
+	if (!f || fwrite(rgb, 1, outW * outH * 3, f) != outW * outH * 3) fail(@"couldn't write a frame");
 	fclose(f);
 	printf("frame %zu %zu %s\n", outW, outH, path.UTF8String);
 }
@@ -483,8 +486,10 @@ static void setSize(size_t w, size_t h) {
 	outTex = [gpu newTextureWithDescriptor:d];
 	free(pixels);
 	free(turned);
+	free(rgb);
 	pixels = malloc(w * h * 4);
 	turned = malloc(w * h * 4);
+	rgb = malloc(w * h * 3);
 	dirty = true;
 }
 
