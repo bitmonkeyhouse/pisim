@@ -1,3 +1,7 @@
+![pi in herdr with pisim's viewer showing an iPhone 18 Pro simulator's home screen in a device bezel](docs/screenshot-home.png)
+
+![pisim's viewer showing an app's setup screen in the simulator while the agent builds and installs it in pi](docs/screenshot-bin-night.png)
+
 # pisim
 
 A [pi](https://pi.dev) extension for iOS development: show a booted iOS Simulator inside a [herdr](https://herdr.dev) pane and drive it with your mouse and keyboard, and give the agent tools to see the simulator's screen, tap, type, press buttons and launch apps.
