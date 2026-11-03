@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.0] - 2026-11-03
+
+- ctrl-y then `q` closes the viewer pane, as ctrl-c does.
+- The pane is titled with the menu key, e.g. "iPhone 16 (ctrl-y for menu)".
+- The ctrl-y hint fits narrower panes: it no longer lists the arrow keys (they still rotate), and it's cut at the pane's width rather than wrapping.
+
 ## [0.14.0] - 2026-11-03
 
 - The viewer widens its herdr pane when the device turns or a foldable opens and no longer fits at physical size, and puts the old width back once it fits again. A pane you've resized yourself, or a zoomed viewer, is left alone.
