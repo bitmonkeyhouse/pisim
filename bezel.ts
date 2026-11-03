@@ -4,9 +4,9 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { helper } from "./sim.ts";
 
 const run = promisify(execFile);
-const size = (png: Buffer) => ({ w: png.readUInt32BE(16), h: png.readUInt32BE(20) });
 
 // In framebuffer pixels: whole bezel w x h, screen hole at x,y sized hw x hh.
 export type Bezel = { pdf: string; dir: string; w: number; h: number; x: number; y: number; hw: number; hh: number };
@@ -24,9 +24,8 @@ export async function loadBezel(udid: string, shotWidth: number): Promise<Bezel>
 	const pdf = join(res, `${composite}.pdf`);
 
 	const dir = await mkdtemp(join(tmpdir(), "pisim-bezel-"));
-	const file = join(dir, "bezel.png");
-	await run("sips", ["-s", "format", "png", pdf, "--out", file]); // natural size, in points
-	const pt = size(await readFile(file));
+	const [ptW, ptH] = (await run(await helper("simvideo"), ["bezel-size", pdf])).stdout.trim().split(" ").map(Number);
+	const pt = { w: ptW, h: ptH };
 	const scale = shotWidth / (pt.w - s.leftWidth - s.rightWidth);
 	const px = (n: number) => Math.round(n * scale);
 	return {
@@ -57,30 +56,16 @@ export type BezelRender = {
 	holeY: number;
 	holeW: number;
 	holeH: number;
-	background: string; // ffmpeg colour, e.g. 0x1a1b26
+	background: string; // rrggbb hex, e.g. 1a1b26
 };
 
 // Renders the bezel as a PNG with the screen cut out (shape from a masked screenshot's alpha), so
-// frames drawn underneath show through. Frames have square corners whose tips stick out past the
-// bezel's rounded outline, so the cut-out's corners are filled with the terminal background.
+// frames drawn underneath show through; see simvideo.m.
 export async function renderBezel(bezel: Bezel, maskedShot: Buffer, o: BezelRender): Promise<Buffer> {
 	const file = join(bezel.dir, "bezel.png");
 	const mask = join(bezel.dir, "mask.png");
-	await run("sips", ["-s", "format", "png", "-z", String(o.h), String(o.w), bezel.pdf, "--out", file]);
 	await writeFile(mask, maskedShot);
-	const canvas = `${o.canvasW}:${o.canvasH}`;
-	const graph =
-		`[0]format=rgba,pad=${canvas}:${o.padLeft}:${o.padTop}:color=0x00000000,split[b][c];` +
-		`[1]alphaextract,scale=${o.holeW}:${o.holeH},negate,split[n][n2];` +
-		`[n]pad=${canvas}:${o.holeX}:${o.holeY}:color=white[m];` +
-		`[b]alphaextract[a];[a][m]blend=all_mode=multiply[keep];[c][keep]alphamerge[bez];` +
-		`color=c=${o.background}:s=${o.holeW}x${o.holeH}:d=1,format=rgba[bg];` +
-		`[bg][n2]alphamerge,pad=${canvas}:${o.holeX}:${o.holeY}:color=0x00000000[corners];` +
-		`[corners][bez]overlay=format=rgb`;
-	const { stdout } = await run(
-		"ffmpeg",
-		["-v", "error", "-i", file, "-i", mask, "-filter_complex", graph, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"],
-		{ encoding: "buffer", maxBuffer: 64 << 20 },
-	);
-	return stdout;
+	const nums = [o.w, o.h, o.canvasW, o.canvasH, o.padLeft, o.padTop, o.holeX, o.holeY, o.holeW, o.holeH].map(String);
+	await run(await helper("simvideo"), ["bezel", bezel.pdf, mask, file, ...nums, o.background]);
+	return readFile(file);
 }

@@ -19,7 +19,7 @@ type Layout = { w: number; h: number; screen: Box; bezel?: Box & { png: Buffer }
 const ESC = "\x1b";
 const out = process.stdout;
 let cell = { w: 8, h: 16 }; // fallbacks if the terminal doesn't answer
-let background = "black";
+let background = "000000";
 let bezel: Bezel | null | undefined; // null when the device has no usable bezel
 let video: ChildProcess | undefined;
 let source: { w: number; h: number } | undefined; // the display's size in pixels, from simvideo
@@ -47,7 +47,7 @@ function queryTerminal(): Promise<void> {
 			const size = /\x1b\[6;(\d+);(\d+)t/.exec(reply);
 			const bg = /\x1b\]11;rgb:([0-9a-f]+)\/([0-9a-f]+)\/([0-9a-f]+)/i.exec(reply);
 			if (size) cell = { h: Number(size[1]), w: Number(size[2]) };
-			if (bg) background = `0x${bg.slice(1).map((c) => (c + c).slice(0, 2)).join("")}`;
+			if (bg) background = bg.slice(1).map((c) => (c + c).slice(0, 2)).join("");
 			if (size && bg) done();
 		};
 		process.stdin.on("data", onData);

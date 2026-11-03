@@ -85,9 +85,13 @@ export async function describe(udid: string): Promise<string> {
 
 // Native helpers, built with clang when missing or older than their source:
 // simhid (simhid.m) sends touches and keys over one connection kept open to the simulator (a fresh
-// connection per event costs ~0.5s); simvideo (simvideo.m) streams the display when it changes.
+// connection per event costs ~0.5s); simvideo (simvideo.m) streams the display when it changes and
+// renders the device bezel.
 const here = dirname(fileURLToPath(import.meta.url));
-const frameworks = { simhid: ["Foundation"], simvideo: ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders"] };
+const frameworks = {
+	simhid: ["Foundation"],
+	simvideo: ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO"],
+};
 
 export async function helper(name: keyof typeof frameworks): Promise<string> {
 	const src = join(here, `${name}.m`);

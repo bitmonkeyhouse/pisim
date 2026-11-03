@@ -1,4 +1,6 @@
-// simvideo: streams a booted simulator's main display as raw RGBA frames, only when it changes.
+// simvideo: streams a booted simulator's main display, and renders its bezel.
+//
+// simvideo <udid>: streams the display as raw RGBA frames, only when it changes.
 // stdin, one command per line:
 //   size <w> <h>   deliver frames scaled to w x h pixels (nothing is sent until this arrives)
 //   next           the reader is ready for another frame
@@ -12,9 +14,19 @@
 // framebufferSurface IOSurface, and SimScreen frame/surface callbacks. The GPU scales the surface
 // (wrapped as a Metal texture, no copy) into an RGBA texture; the CPU only reads that back.
 //
-// Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders simvideo.m -o simvideo
+// simvideo bezel-size <pdf>: prints a DeviceKit bezel PDF's page size in points, "<w> <h>".
+// simvideo bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>:
+//   draws the bezel at w x h on a transparent canvasW x canvasH canvas at padLeft,padTop, with the
+//   screen cut out of the hole rect in the shape of mask.png's alpha (a masked screenshot), so frames
+//   drawn underneath show through. Frames have square corners whose tips stick out past the bezel's
+//   rounded outline, so the hole's corners are filled with the terminal background. Positions are in
+//   pixels from the top-left.
+//
+// Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders -framework CoreGraphics -framework ImageIO simvideo.m -o simvideo
+#import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
+#import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <dlfcn.h>
@@ -136,9 +148,61 @@ static void setSize(size_t w, size_t h) {
 	dirty = true;
 }
 
+static CGPDFPageRef pdfPage(const char *path) {
+	CGPDFDocumentRef doc = CGPDFDocumentCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(path)]);
+	CGPDFPageRef p = doc ? CGPDFDocumentGetPage(doc, 1) : NULL; // the document is kept for the process's life
+	if (!p) fail([NSString stringWithFormat:@"can't read %s", path]);
+	return p;
+}
+
+// argv: <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>
+static void renderBezel(char **argv) {
+	double n[10];
+	for (int i = 0; i < 10; i++) n[i] = atof(argv[3 + i]);
+	double w = n[0], h = n[1], cw = n[2], ch = n[3], padLeft = n[4], padTop = n[5];
+	unsigned rgb = (unsigned)strtoul(argv[13], NULL, 16);
+	// Core Graphics puts the origin at the bottom-left, so flip y.
+	CGRect hole = CGRectMake(n[6], ch - n[7] - n[9], n[8], n[9]);
+
+	CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+	CGContextRef ctx = CGBitmapContextCreate(NULL, (size_t)cw, (size_t)ch, 8, 0, srgb, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+	CGContextSetRGBFillColor(ctx, (rgb >> 16 & 255) / 255.0, (rgb >> 8 & 255) / 255.0, (rgb & 255) / 255.0, 1);
+	CGContextFillRect(ctx, hole);
+
+	CGPDFPageRef p = pdfPage(argv[0]);
+	CGRect box = CGPDFPageGetBoxRect(p, kCGPDFMediaBox);
+	CGContextSaveGState(ctx);
+	CGContextTranslateCTM(ctx, padLeft, ch - padTop - h);
+	CGContextScaleCTM(ctx, w / box.size.width, h / box.size.height);
+	CGContextTranslateCTM(ctx, -box.origin.x, -box.origin.y);
+	CGContextDrawPDFPage(ctx, p);
+	CGContextRestoreGState(ctx);
+
+	CGImageSourceRef maskSrc = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(argv[1])], NULL);
+	CGImageRef mask = maskSrc ? CGImageSourceCreateImageAtIndex(maskSrc, 0, NULL) : NULL;
+	if (!mask) fail([NSString stringWithFormat:@"can't read %s", argv[1]]);
+	CGContextSetBlendMode(ctx, kCGBlendModeDestinationOut); // erase where the screen is opaque
+	CGContextDrawImage(ctx, hole, mask);
+
+	CGImageRef out = CGBitmapContextCreateImage(ctx);
+	CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(argv[2])], CFSTR("public.png"), 1, NULL);
+	if (!dest) fail([NSString stringWithFormat:@"can't write %s", argv[2]]);
+	CGImageDestinationAddImage(dest, out, NULL);
+	if (!CGImageDestinationFinalize(dest)) fail([NSString stringWithFormat:@"can't write %s", argv[2]]);
+}
+
 int main(int argc, char **argv) {
 	@autoreleasepool {
-		if (argc != 2) fail(@"usage: simvideo <udid>");
+		if (argc == 3 && !strcmp(argv[1], "bezel-size")) {
+			CGRect box = CGPDFPageGetBoxRect(pdfPage(argv[2]), kCGPDFMediaBox);
+			printf("%.0f %.0f\n", box.size.width, box.size.height);
+			return 0;
+		}
+		if (argc == 16 && !strcmp(argv[1], "bezel")) {
+			renderBezel(argv + 2);
+			return 0;
+		}
+		if (argc != 2) fail(@"usage: simvideo <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>");
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		// Closing the pane hangs up everything in it; exit on end of input instead, which also comes
 		// when the viewer goes, so the frame directory is cleaned up.
