@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.0] - 2026-11-03
+
+- Screenshots at the top of the README.
+
 ## [0.10.0] - 2026-11-03
 
 - First published release, as `@bitmonkey/pisim`: README, MIT licence and NOTICE for idb.
