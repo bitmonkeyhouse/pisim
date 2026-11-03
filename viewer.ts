@@ -1,11 +1,12 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
 // clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
-// the device bezel is a second image drawn on top. Ctrl-C quits.
+// the device bezel is a second image drawn on top. Ctrl-Y then h/l/s/+/- presses Home, Lock, Siri or
+// volume up/down; Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { type Bezel, fits, loadBezel, renderBezel } from "./bezel.ts";
-import { helper, keyLines, keymap, screenshot, startHid } from "./sim.ts";
+import { type Button, buttonLines, helper, keyLines, keymap, screenshot, startHid } from "./sim.ts";
 
 const [udid, label = udid] = process.argv.slice(2);
 if (!udid) {
@@ -259,11 +260,23 @@ let keys = new Map<string, number[]>();
 keymap(udid).then((k) => (keys = k));
 const press = (k: number[]) => keyLines(k).forEach(send);
 
+// Ctrl-Y then a key presses a hardware button; any other key cancels.
+const BUTTON_KEYS: Record<string, Button> = { h: "home", l: "lock", s: "siri", "+": "volume-up", "-": "volume-down" };
+let buttonPrefix = false;
+
 function onInput(d: Buffer) {
 	for (const [tok, b, x, y, kind] of d.toString().matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])|\x1b\[[ABCD]|[\s\S]/g)) {
 		if (kind) onMouse(Number(b), Number(x), Number(y), kind === "m");
 		else if (tok === "\x03") quit();
-		else if (keys.has(tok)) press(keys.get(tok)!);
+		else if (buttonPrefix) {
+			buttonPrefix = false;
+			status();
+			const button = BUTTON_KEYS[tok.toLowerCase()];
+			if (button) buttonLines(button).forEach(send);
+		} else if (tok === "\x19") {
+			buttonPrefix = true;
+			status("h home  l lock  s siri  +/- volume  (other: cancel)");
+		} else if (keys.has(tok)) press(keys.get(tok)!);
 	}
 }
 

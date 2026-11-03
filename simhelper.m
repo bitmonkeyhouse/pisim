@@ -5,6 +5,7 @@
 //   read from stdin, one command per line:
 //     down <x> <y> | move <x> <y> | up <x> <y>   touch, x/y as fractions of the screen from top-left
 //     key <usage> down|up                         USB HID keyboard usage code
+//     button <page> <usage> down|up              hardware button, as a HID usage page and code
 //   Prints "ready" once dtuhidd has answered. Each separate connection pays ~0.5s for dtuhidd to
 //   activate; this pays it once.
 //
@@ -193,13 +194,19 @@ static void runHid(NSString *udid) {
 	while (fgets(line, sizeof line, stdin)) {
 		char cmd[8], state[8];
 		double x, y;
-		unsigned long long usage;
+		unsigned long long usage, page;
 		if (sscanf(line, "%7s %lf %lf", cmd, &x, &y) == 3 && (!strcmp(cmd, "down") || !strcmp(cmd, "move") || !strcmp(cmd, "up"))) {
 			uint64_t type = !strcmp(cmd, "up") ? 2 : touching ? 1 : 0; // a down while touching continues the contact
 			touching = type != 2;
 			xpc_connection_send_message(conn, touchEvent(x, y, type));
 		} else if (sscanf(line, "key %llu %7s", &usage, state) == 2) {
 			xpc_connection_send_message(conn, message("IndigoKeyboardButtonEvent", false, keyPayload(usage, !strcmp(state, "down"))));
+		} else if (sscanf(line, "button %llu %llu %7s", &page, &usage, state) == 3) {
+			xpc_object_t p = xpc_dictionary_create(NULL, NULL, 0);
+			xpc_dictionary_set_uint64(p, "usagePage", page);
+			xpc_dictionary_set_uint64(p, "usageCode", usage);
+			xpc_dictionary_set_uint64(p, "state", !strcmp(state, "down") ? 1 : 2);
+			xpc_connection_send_message(conn, message("IndigoButtonEvent", false, p));
 		} else {
 			fprintf(stderr, "simhelper: ignoring %s", line);
 		}

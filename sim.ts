@@ -132,3 +132,10 @@ export async function keymap(udid: string): Promise<Map<string, number[]>> {
 
 // simhelper hid lines that press and release a key with its modifiers.
 export const keyLines = (keys: number[]) => [...keys.map((k) => `key ${k} down`), ...keys.toReversed().map((k) => `key ${k} up`)];
+
+// Hardware buttons as HID consumer-page usages (page 0x0C), as idb sends them.
+export const BUTTONS = { home: 0x40, lock: 0x30, siri: 0xcf, "volume-up": 0xe9, "volume-down": 0xea } as const;
+export type Button = keyof typeof BUTTONS;
+
+// simhelper hid lines that press and release a hardware button.
+export const buttonLines = (b: Button) => [`button 12 ${BUTTONS[b]} down`, `button 12 ${BUTTONS[b]} up`];

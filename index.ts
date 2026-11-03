@@ -3,8 +3,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { type AXNode, describe, type Device, keyLines, keymap, listBooted, screenshot, simctl, startHid, uiTree } from "./sim.ts";
+import { type AXNode, BUTTONS, buttonLines, describe, type Device, keyLines, keymap, listBooted, screenshot, simctl, startHid, uiTree } from "./sim.ts";
 
 const run = promisify(execFile);
 const viewer = join(dirname(fileURLToPath(import.meta.url)), "viewer.ts");
@@ -169,6 +170,19 @@ export default function (pi: ExtensionAPI) {
 			if (missing.length) throw new Error(`Can't type ${missing.map((c) => JSON.stringify(c)).join(", ")} on the simulator's keyboard layout`);
 			await hidSend(udid, [...params.text].flatMap((c) => keyLines(keys.get(c)!)));
 			return done(udid, `Typed ${JSON.stringify(params.text)}`);
+		},
+	});
+
+	pi.registerTool({
+		name: "sim_button",
+		label: "Simulator button",
+		description: "Press a hardware button on a booted iOS simulator: home (go to the home screen), lock (side button: lock or wake), siri, volume-up or volume-down.",
+		promptSnippet: "Press a hardware button (home, lock, siri, volume) on a booted iOS simulator",
+		parameters: Type.Object({ button: StringEnum(Object.keys(BUTTONS) as (keyof typeof BUTTONS)[]), device }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { udid } = await pick(params.device ?? "", ctx);
+			await hidSend(udid, buttonLines(params.button));
+			return done(udid, `Pressed ${params.button}`);
 		},
 	});
 
