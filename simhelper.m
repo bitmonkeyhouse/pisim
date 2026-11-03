@@ -6,19 +6,27 @@
 //     down <x> <y> | move <x> <y> | up <x> <y>   touch, x/y as fractions of the screen from top-left
 //     key <usage> down|up                         USB HID keyboard usage code
 //     button <page> <usage> down|up              hardware button, as a HID usage page and code
+//     orientation <1-4>                           rotate the device: portrait, upside down, landscape
+//                                                 with its top on the left (3) or on the right (4)
+//   Touch coordinates are in the display buffer, which stays portrait when the device rotates.
 //   Prints "ready" once dtuhidd has answered. Each separate connection pays ~0.5s for dtuhidd to
 //   activate; this pays it once.
 //
-// simhelper video <udid>
+// simhelper video <udid> [<terminal pid>...]
 //   Streams the main display as raw RGBA frames, only when it changes. stdin, one command per line:
-//     size <w> <h>   deliver frames scaled to w x h pixels (nothing is sent until this arrives)
+//     rotate <0-3>   turn frames clockwise by that many quarter turns, to match a rotated device
+//                    (the display buffer stays portrait); nothing is sent until the next size
+//     size <w> <h>   deliver frames scaled to w x h pixels, after any rotation (nothing is sent until
+//                    this arrives)
 //     next           the reader is ready for another frame
 //   stdout:
-//     source <w> <h>         the display's size in pixels, at start and whenever it changes (rotation)
+//     source <w> <h>         the display buffer's size in pixels, at start and whenever it changes
 //     frame <w> <h> <path>   a w x h RGBA file; the reader (the terminal, via Kitty's t=t) deletes it
+//     ppi <n>                pixels per inch of the display showing the terminal (the frontmost
+//                            window of the given apps), at start and whenever it changes
 //   At most one frame is in flight: after "frame", nothing more is sent until "next". The GPU scales
 //   the display surface (wrapped as a Metal texture, no copy) into an RGBA texture; the CPU only
-//   reads that back.
+//   reads that back, and turns it if the device is rotated.
 //
 // simhelper describe <udid>
 //   Prints the frontmost app's accessibility tree as JSON: an array holding the app element, each
@@ -30,18 +38,19 @@
 // simhelper bezel-size <pdf>
 //   Prints a DeviceKit bezel PDF's page size in points, "<w> <h>".
 //
-// simhelper bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>
-//   Draws the bezel at w x h on a transparent canvasW x canvasH canvas at padLeft,padTop, with the
-//   screen cut out of the hole rect in the shape of mask.png's alpha (a masked screenshot), so frames
-//   drawn underneath show through. Frames have square corners whose tips stick out past the bezel's
-//   rounded outline, so the hole's corners are filled with the terminal background. Positions are in
-//   pixels from the top-left.
+// simhelper bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter>
+//   Draws the bezel at w x h on a transparent canvasW x canvasH canvas at padLeft,padTop, turned
+//   clockwise by `quarter` quarter turns, with the screen cut out of the hole rect in the shape of
+//   mask.png's alpha (a masked screenshot), so frames drawn underneath show through. Frames have
+//   square corners whose tips stick out past the bezel's rounded outline, so the hole's corners are
+//   filled with the terminal background. Positions are in pixels from the top-left, after turning.
 //
 // The HID connection and wire format, finding and following the display, and reading accessibility
 // follow Meta's idb (MIT licence): FBSimulatorControl/HID, FBSimulatorControl/XPC,
 // FBSimulatorControl/Framebuffer and FBSimulatorAX.
 //
-// Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders -framework CoreGraphics -framework ImageIO simhelper.m -o simhelper
+// Build: clang -fobjc-arc -framework Foundation -framework IOSurface -framework Metal -framework MetalPerformanceShaders -framework CoreGraphics -framework ImageIO -framework Accelerate simhelper.m -o simhelper
+#import <Accelerate/Accelerate.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
@@ -167,8 +176,32 @@ static xpc_object_t touchEvent(double x, double y, uint64_t type) {
 	return message("IndigoDigitizerEvent", false, p);
 }
 
+// Rotates the device: a GSEvent "device orientation changed" mach message to SpringBoard's
+// PurpleWorkspacePort, laid out as idb's SimulatorPurpleHID builds it. (idb uses a vendor HID event
+// instead on runtimes that report device motion; none of the iPhone runtimes tested here do, and the
+// Purple message works on them.)
+static void sendOrientation(id dev, uint32_t orientation) {
+	NSError *err;
+	mach_port_t port = [dev lookup:@"PurpleWorkspacePort" error:&err];
+	if (!port) {
+		fprintf(stderr, "simhelper: no PurpleWorkspacePort: %s\n", err.localizedDescription.UTF8String);
+		return;
+	}
+	uint32_t msg[28] = { 0 };                     // 112 bytes; the mach message is the first 108
+	msg[0] = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0); // header: bits, size, remote port, local port, voucher, id
+	msg[1] = 108;
+	msg[2] = port;
+	msg[5] = 0x7B;
+	msg[0x18 / 4] = 50 | 0x20000; // GSEventTypeDeviceOrientationChanged | host flag
+	msg[0x48 / 4] = 4;            // record info size
+	msg[0x4C / 4] = orientation;
+	kern_return_t kr = mach_msg((mach_msg_header_t *)msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT, 108, 0, MACH_PORT_NULL, 2000, MACH_PORT_NULL);
+	if (kr != KERN_SUCCESS) fprintf(stderr, "simhelper: orientation not sent: %s\n", mach_error_string(kr));
+}
+
 static void runHid(NSString *udid) {
-	xpc_connection_t conn = connectTo(device(udid), Service);
+	id dev = device(udid);
+	xpc_connection_t conn = connectTo(dev, Service);
 	xpc_connection_set_target_queue(conn, dispatch_queue_create("simhelper.hid", DISPATCH_QUEUE_SERIAL));
 	xpc_connection_set_event_handler(conn, ^(xpc_object_t e) {
 		// Interrupted: XPC reconnects on the next send, but a touch in progress is lost. Invalid: give up.
@@ -207,6 +240,8 @@ static void runHid(NSString *udid) {
 			xpc_dictionary_set_uint64(p, "usageCode", usage);
 			xpc_dictionary_set_uint64(p, "state", !strcmp(state, "down") ? 1 : 2);
 			xpc_connection_send_message(conn, message("IndigoButtonEvent", false, p));
+		} else if (sscanf(line, "orientation %llu", &usage) == 1 && usage >= 1 && usage <= 4) {
+			sendOrientation(dev, (uint32_t)usage);
 		} else {
 			fprintf(stderr, "simhelper: ignoring %s", line);
 		}
@@ -234,7 +269,8 @@ static id mainDisplay(id dev) {
 // All state below is touched only on `work`.
 static dispatch_queue_t work;
 static IOSurfaceRef surface;
-static size_t srcW, srcH, outW, outH;
+static size_t srcW, srcH, outW, outH; // out: the delivered size, after turning
+static unsigned quarter;              // clockwise quarter turns to apply
 static bool dirty = true, wanted = true;
 static unsigned long frameNo;
 static NSString *dir;
@@ -242,7 +278,7 @@ static id<MTLDevice> gpu;
 static id<MTLCommandQueue> gpuQueue;
 static MPSImageLanczosScale *scaler;
 static id<MTLTexture> srcTex, outTex;
-static void *pixels;
+static void *pixels, *turned;
 
 static void setSurface(IOSurfaceRef s) {
 	if (surface) CFRelease(surface);
@@ -272,28 +308,60 @@ static void deliver(void) {
 	[scaler encodeToCommandBuffer:cmd sourceTexture:srcTex destinationTexture:outTex]; // BGRA in, RGBA out
 	[cmd commit];
 	[cmd waitUntilCompleted];
-	[outTex getBytes:pixels bytesPerRow:outW * 4 fromRegion:MTLRegionMake2D(0, 0, outW, outH) mipmapLevel:0];
+	size_t sw = quarter % 2 ? outH : outW, sh = quarter % 2 ? outW : outH; // the scaled size, before turning
+	[outTex getBytes:pixels bytesPerRow:sw * 4 fromRegion:MTLRegionMake2D(0, 0, sw, sh) mipmapLevel:0];
+	void *data = pixels;
+	if (quarter) {
+		const uint8_t clockwise[4] = { kRotate0DegreesClockwise, kRotate90DegreesClockwise, kRotate180DegreesClockwise, kRotate270DegreesClockwise };
+		vImage_Buffer from = { pixels, sh, sw, sw * 4 }, to = { turned, outH, outW, outW * 4 };
+		const uint8_t clear[4] = { 0 };
+		vImageRotate90_ARGB8888(&from, &to, clockwise[quarter], clear, kvImageNoFlags);
+		data = turned;
+	}
 
 	// Kitty's t=t: the terminal deletes the file once read, if it's in a temp dir and named like this.
 	NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"tty-graphics-protocol-%lu.rgba", frameNo++]];
 	FILE *f = fopen(path.fileSystemRepresentation, "wb");
-	if (!f || fwrite(pixels, 1, outW * outH * 4, f) != outW * outH * 4) fail(@"couldn't write a frame");
+	if (!f || fwrite(data, 1, outW * outH * 4, f) != outW * outH * 4) fail(@"couldn't write a frame");
 	fclose(f);
 	printf("frame %zu %zu %s\n", outW, outH, path.UTF8String);
 }
 
+// w x h is the delivered size; the GPU scales to it before turning.
 static void setSize(size_t w, size_t h) {
 	outW = w, outH = h;
-	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+	size_t sw = quarter % 2 ? h : w, sh = quarter % 2 ? w : h;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:sw height:sh mipmapped:NO];
 	d.usage = MTLTextureUsageShaderWrite;
 	d.storageMode = MTLStorageModeShared;
 	outTex = [gpu newTextureWithDescriptor:d];
 	free(pixels);
+	free(turned);
 	pixels = malloc(w * h * 4);
+	turned = malloc(w * h * 4);
 	dirty = true;
 }
 
-static void runVideo(NSString *udid) {
+// Pixels per inch of the display under the centre of the frontmost on-screen window owned by one of
+// `pids` (the main display if there's none): backing pixels across over the physical width.
+static double terminalPpi(NSArray<NSNumber *> *pids) {
+	CGDirectDisplayID display = CGMainDisplayID();
+	NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+	for (NSDictionary *w in windows) { // front to back
+		if ([w[(id)kCGWindowLayer] intValue] != 0 || ![pids containsObject:w[(id)kCGWindowOwnerPID]]) continue;
+		CGRect r;
+		CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &r);
+		uint32_t n;
+		CGGetDisplaysWithPoint(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 1, &display, &n);
+		break;
+	}
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+	double px = mode ? CGDisplayModeGetPixelWidth(mode) : 0, mm = CGDisplayScreenSize(display).width;
+	CGDisplayModeRelease(mode);
+	return mm > 0 ? px / (mm / 25.4) : 0;
+}
+
+static void runVideo(NSString *udid, NSArray<NSNumber *> *terminalPids) {
 	// Closing the pane hangs up everything in it; exit on end of input instead, which also comes
 	// when the viewer goes, so the frame directory is cleaned up.
 	signal(SIGHUP, SIG_IGN);
@@ -327,15 +395,34 @@ static void runVideo(NSString *udid) {
 		}
 		propertiesChangedCallback:^(id properties){
 		}];
+
+	// Watch which display the terminal is on, so the viewer can keep the device at physical size.
+	// Printed on `work`, like everything else on stdout, so lines don't interleave.
+	__block double ppi = -1; // so the first reading is always printed, even 0 (unknown)
+	dispatch_source_t watch = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, work);
+	dispatch_source_set_timer(watch, DISPATCH_TIME_NOW, NSEC_PER_SEC, NSEC_PER_SEC / 4);
+	dispatch_source_set_event_handler(watch, ^{
+		double now = terminalPpi(terminalPids);
+		if (fabs(now - ppi) < 1) return;
+		ppi = now;
+		printf("ppi %.1f\n", ppi);
+	});
+	dispatch_resume(watch);
 	dispatch_async(work, ^{ deliver(); });
 
 	char line[64];
 	size_t w, h;
 	while (fgets(line, sizeof line, stdin)) {
+		unsigned q;
 		if (sscanf(line, "size %zu %zu", &w, &h) == 2 && w && h) {
 			dispatch_async(work, ^{
 				setSize(w, h);
 				deliver();
+			});
+		} else if (sscanf(line, "rotate %u", &q) == 1) {
+			dispatch_async(work, ^{
+				quarter = q % 4;
+				outW = outH = 0; // wait for the size laid out for this orientation
 			});
 		} else if (!strncmp(line, "next", 4)) {
 			dispatch_async(work, ^{
@@ -426,12 +513,13 @@ static CGPDFPageRef pdfPage(const char *path) {
 	return p;
 }
 
-// argv: <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>
+// argv: <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter>
 static void renderBezel(char **argv) {
 	double n[10];
 	for (int i = 0; i < 10; i++) n[i] = atof(argv[3 + i]);
 	double w = n[0], h = n[1], cw = n[2], ch = n[3], padLeft = n[4], padTop = n[5];
 	unsigned rgb = (unsigned)strtoul(argv[13], NULL, 16);
+	int q = atoi(argv[14]) % 4;
 	// Core Graphics puts the origin at the bottom-left, so flip y.
 	CGRect hole = CGRectMake(n[6], ch - n[7] - n[9], n[8], n[9]);
 
@@ -440,12 +528,14 @@ static void renderBezel(char **argv) {
 	CGContextSetRGBFillColor(ctx, (rgb >> 16 & 255) / 255.0, (rgb >> 8 & 255) / 255.0, (rgb & 255) / 255.0, 1);
 	CGContextFillRect(ctx, hole);
 
+	// The PDF is drawn turned about the centre of its w x h box; before turning it is h x w for odd q.
 	CGPDFPageRef p = pdfPage(argv[0]);
 	CGRect box = CGPDFPageGetBoxRect(p, kCGPDFMediaBox);
 	CGContextSaveGState(ctx);
-	CGContextTranslateCTM(ctx, padLeft, ch - padTop - h);
-	CGContextScaleCTM(ctx, w / box.size.width, h / box.size.height);
-	CGContextTranslateCTM(ctx, -box.origin.x, -box.origin.y);
+	CGContextTranslateCTM(ctx, padLeft + w / 2, ch - padTop - h / 2);
+	CGContextRotateCTM(ctx, -q * M_PI_2); // negative is clockwise with y up
+	CGContextScaleCTM(ctx, (q % 2 ? h : w) / box.size.width, (q % 2 ? w : h) / box.size.height);
+	CGContextTranslateCTM(ctx, -box.origin.x - box.size.width / 2, -box.origin.y - box.size.height / 2);
 	CGContextDrawPDFPage(ctx, p);
 	CGContextRestoreGState(ctx);
 
@@ -453,7 +543,12 @@ static void renderBezel(char **argv) {
 	CGImageRef mask = maskSrc ? CGImageSourceCreateImageAtIndex(maskSrc, 0, NULL) : NULL;
 	if (!mask) fail([NSString stringWithFormat:@"can't read %s", argv[1]]);
 	CGContextSetBlendMode(ctx, kCGBlendModeDestinationOut); // erase where the screen is opaque
-	CGContextDrawImage(ctx, hole, mask);
+	// The screenshot may or may not be turned yet; its corners are symmetric, so lay it along the hole.
+	bool maskWide = CGImageGetWidth(mask) > CGImageGetHeight(mask), holeWide = hole.size.width > hole.size.height;
+	CGContextTranslateCTM(ctx, CGRectGetMidX(hole), CGRectGetMidY(hole));
+	if (maskWide != holeWide) CGContextRotateCTM(ctx, M_PI_2);
+	double mw = maskWide != holeWide ? hole.size.height : hole.size.width, mh = maskWide != holeWide ? hole.size.width : hole.size.height;
+	CGContextDrawImage(ctx, CGRectMake(-mw / 2, -mh / 2, mw, mh), mask);
 
 	CGImageRef out = CGBitmapContextCreateImage(ctx);
 	CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(argv[2])], CFSTR("public.png"), 1, NULL);
@@ -467,13 +562,17 @@ int main(int argc, char **argv) {
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		const char *cmd = argc > 1 ? argv[1] : "";
 		if (argc == 3 && !strcmp(cmd, "hid")) runHid(@(argv[2]));
-		else if (argc == 3 && !strcmp(cmd, "video")) runVideo(@(argv[2]));
+		else if (argc >= 3 && !strcmp(cmd, "video")) {
+			NSMutableArray *pids = [NSMutableArray array];
+			for (int i = 3; i < argc; i++) [pids addObject:@(atoi(argv[i]))];
+			runVideo(@(argv[2]), pids);
+		}
 		else if (argc == 3 && !strcmp(cmd, "describe")) describeScreen(@(argv[2]));
 		else if (argc == 3 && !strcmp(cmd, "bezel-size")) {
 			CGRect box = CGPDFPageGetBoxRect(pdfPage(argv[2]), kCGPDFMediaBox);
 			printf("%.0f %.0f\n", box.size.width, box.size.height);
-		} else if (argc == 16 && !strcmp(cmd, "bezel")) renderBezel(argv + 2);
-		else fail(@"usage: simhelper hid <udid> | video <udid> | describe <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb>");
+		} else if (argc == 17 && !strcmp(cmd, "bezel")) renderBezel(argv + 2);
+		else fail(@"usage: simhelper hid <udid> | video <udid> | describe <udid> | bezel-size <pdf> | bezel <pdf> <mask.png> <out.png> <w> <h> <canvasW> <canvasH> <padLeft> <padTop> <holeX> <holeY> <holeW> <holeH> <rrggbb> <quarter>");
 	}
 	return 0;
 }

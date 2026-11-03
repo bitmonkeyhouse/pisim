@@ -85,7 +85,7 @@ export async function describe(udid: string): Promise<string> {
 // it changes, and "bezel" renders the device bezel. Built with clang when missing or older than its source.
 const src = join(dirname(fileURLToPath(import.meta.url)), "simhelper.m");
 const bin = src.replace(/\.m$/, "");
-const frameworks = ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO"];
+const frameworks = ["Foundation", "IOSurface", "Metal", "MetalPerformanceShaders", "CoreGraphics", "ImageIO", "Accelerate"];
 
 export async function helper(): Promise<string> {
 	if (!existsSync(bin) || statSync(bin).mtimeMs < statSync(src).mtimeMs) {

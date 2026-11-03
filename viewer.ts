@@ -1,12 +1,15 @@
 // Shows a simulator in the current terminal pane via the Kitty graphics protocol, and drives it:
 // clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
 // the device bezel is a second image drawn on top. Ctrl-Y then h/l/s/+/- presses Home, Lock, Siri or
-// volume up/down; Ctrl-C quits.
+// volume up/down, r or the arrows rotate the device, and z zooms to fill the pane; Ctrl-C quits.
 // Usage: node viewer.ts <udid> [label]
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
-import { type Bezel, fits, loadBezel, renderBezel } from "./bezel.ts";
+import { promisify } from "node:util";
+import { type Bezel, fits, loadBezel, renderBezel, screenPitch, turnBezel } from "./bezel.ts";
 import { type Button, buttonLines, helper, keyLines, keymap, screenshot, startHid } from "./sim.ts";
+
+const run = promisify(execFile);
 
 const [udid, label = udid] = process.argv.slice(2);
 if (!udid) {
@@ -24,7 +27,14 @@ let background = "000000";
 let bezel: Bezel | null | undefined; // null when the device has no usable bezel
 let video: ChildProcess | undefined;
 let source: { w: number; h: number } | undefined; // the display's size in pixels, from simhelper video
-let layout: Layout | undefined; // recomputed on resize and when the display's size changes (rotation)
+let layout: Layout | undefined; // recomputed on resize and when the device or the display's size changes
+// How far the device is turned clockwise, in quarter turns. The display buffer stays portrait, so the
+// picture is turned to match and clicks are turned back.
+let quarter = 0;
+let zoom = false; // fill the pane instead of physical size
+// simhelper hid's orientation for each: portrait, landscape with its top on the right, upside down,
+// landscape with its top on the left.
+const ORIENTATIONS = [1, 4, 2, 3];
 
 function quit() {
 	video?.stdin!.end(); // simhelper video removes its frame directory when its input closes
@@ -59,16 +69,56 @@ function queryTerminal(): Promise<void> {
 
 const centre = (n: number, k: number) => Math.max(0, Math.floor((n - k) / 2));
 
-// Fits the device into the pane, less a margin of 2 cols each side and 1 row top and bottom.
+// Physical size, as Simulator.app's: the device as big as the real one, in terminal (device) pixels
+// per framebuffer pixel, from the pixels per inch of the display the terminal is on (simhelper video
+// reports it, and again when the window moves to another display) and the device's. Infinity if
+// either is unknown, so the device just fits the pane.
+// shortcut: assumes the terminal's cell size in pixels stays the same; moving between displays with
+// different scales (Retina and non-Retina) needs the viewer reopened.
+let ppi = 0;
+let gotPpi: () => void;
+const firstPpi = new Promise<void>((resolve) => (gotPpi = resolve));
+const pitch = screenPitch(udid).catch(() => 0);
+async function naturalScale(): Promise<number> {
+	await firstPpi;
+	const p = await pitch;
+	return ppi > 0 && p > 0 ? ppi / p : Infinity;
+}
+
+// The apps (terminal windows) showing this pane: the nearest .app ancestor of each herdr client, and
+// of this process, for a viewer run outside herdr. herdr runs panes under its server, not the client.
+async function terminalPids(): Promise<string[]> {
+	const { stdout } = await run("ps", ["-A", "-o", "pid=,ppid=,comm="]);
+	const procs = new Map(stdout.trim().split("\n").map((l) => {
+		const [, pid, ppid, comm] = l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)!;
+		return [pid, { ppid, comm }];
+	}));
+	const starts = [String(process.pid), ...[...procs].filter(([, p]) => /(^|\/)herdr$/.test(p.comm)).map(([pid]) => pid)];
+	const apps = new Set<string>();
+	for (const start of starts) {
+		for (let q = procs.get(start)?.ppid; q && q !== "1" && procs.has(q); q = procs.get(q)!.ppid) {
+			if (procs.get(q)!.comm.includes(".app/")) {
+				apps.add(q);
+				break;
+			}
+		}
+	}
+	return [...apps];
+}
+
+// Lays the device out in the pane at physical size, or (zoomed) as big as fits, less a margin of 2
+// cols each side and 1 row top and bottom; a pane too small for that shrinks it to fit.
 // The screen gets a whole-cell box and the bezel is scaled and padded around it so the two line up
 // exactly: Kitty images can only be stretched to whole cells.
 async function layoutFor(w: number, h: number): Promise<Layout> {
 	const cols = out.columns;
 	const rows = out.rows;
 	bezel ??= await loadBezel(udid, Math.min(w, h)).catch(() => null);
-	const b = bezel && fits(bezel, w, h) ? bezel : null;
+	const turned = bezel && turnBezel(bezel, quarter);
+	const b = turned && fits(turned, w, h) ? turned : null;
 	const dev = b ?? { w, h, x: 0, y: 0, hw: w, hh: h };
-	const s = Math.min((Math.max(1, cols - 4) * cell.w) / dev.w, (Math.max(1, rows - 2) * cell.h) / dev.h);
+	const fit = Math.min((Math.max(1, cols - 4) * cell.w) / dev.w, (Math.max(1, rows - 2) * cell.h) / dev.h);
+	const s = zoom ? fit : Math.min(fit, await naturalScale());
 	const c = Math.max(1, Math.round((dev.hw * s) / cell.w));
 	const r = Math.max(1, Math.round((dev.hh * s) / cell.h));
 	const bare = { w, h, screen: { col: centre(cols, c), row: centre(rows, r), c, r } };
@@ -139,7 +189,8 @@ function fail(msg: string) {
 	out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J${ESC}[H${label}: ${msg}\r\n(retrying)`);
 }
 
-// Lays the device out for the display's size and asks simhelper video for frames that fill the screen box.
+// Lays the device out for the display's size, turned to the device's orientation, and asks simhelper
+// video for frames turned the same way that fill the screen box.
 let laying = false;
 let again = false; // a resize or rotation arrived while laying out
 async function relayout() {
@@ -148,11 +199,12 @@ async function relayout() {
 	laying = true;
 	again = false;
 	try {
-		const l = await layoutFor(source.w, source.h);
+		const odd = quarter % 2 === 1;
+		const l = await layoutFor(odd ? source.h : source.w, odd ? source.w : source.h);
 		layout = l;
 		out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J`);
 		if (l.bezel) place(2, BEZEL_Z, l.bezel, l.bezel.png);
-		video?.stdin!.write(`size ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);
+		video?.stdin!.write(`rotate ${quarter}\nsize ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);
 	} catch (e) {
 		fail((e as Error).message);
 	} finally {
@@ -164,11 +216,11 @@ async function relayout() {
 // simhelper video sends "source <w> <h>" when it learns the display's size and "frame <w> <h> <path>" per
 // frame; it waits for "next" before producing another.
 function stream() {
-	helper().then(
-		(bin) => {
+	Promise.all([helper(), terminalPids().catch(() => [])]).then(
+		([bin, pids]) => {
 			let buf = "";
 			let err = "";
-			video = spawn(bin, ["video", udid], { stdio: ["pipe", "pipe", "pipe"] });
+			video = spawn(bin, ["video", udid, ...pids], { stdio: ["pipe", "pipe", "pipe"] });
 			video.stdin!.on("error", () => {}); // a dead helper is reported by "close"
 			video.stdout!.on("data", (d) => {
 				buf += d;
@@ -176,7 +228,12 @@ function stream() {
 					const line = buf.slice(0, i);
 					const src = /^source (\d+) (\d+)$/.exec(line);
 					const frame = /^frame (\d+) (\d+) (.+)$/.exec(line);
-					if (src) {
+					const density = /^ppi ([\d.]+)$/.exec(line);
+					if (density) {
+						ppi = Number(density[1]);
+						gotPpi();
+						if (!zoom) relayout(); // the terminal moved to another display
+					} else if (src) {
 						source = { w: Number(src[1]), h: Number(src[2]) };
 						relayout();
 					} else if (frame && layout) {
@@ -219,6 +276,7 @@ async function connectHid() {
 	}
 	hidReady = true;
 	status();
+	send(`orientation ${ORIENTATIONS[quarter]}`); // the viewer starts portrait, so put the device there too
 	let err = "";
 	hid.stderr!.on("data", (d) => (err += d));
 	hid.on("close", () => {
@@ -246,7 +304,9 @@ let touching = false;
 function onMouse(button: number, x: number, y: number, released: boolean) {
 	const p = onScreen(x, y, touching);
 	if (!p) return;
-	const at = `${p.fx.toFixed(4)} ${p.fy.toFixed(4)}`;
+	// Touches are in the display buffer's portrait coordinates: undo the turn the picture is drawn with.
+	const [bx, by] = [[p.fx, p.fy], [p.fy, 1 - p.fx], [1 - p.fx, 1 - p.fy], [1 - p.fy, p.fx]][quarter];
+	const at = `${bx.toFixed(4)} ${by.toFixed(4)}`;
 	if (released) {
 		if (touching) send(`up ${at}`);
 		touching = false;
@@ -260,9 +320,16 @@ let keys = new Map<string, number[]>();
 keymap(udid).then((k) => (keys = k));
 const press = (k: number[]) => keyLines(k).forEach(send);
 
-// Ctrl-Y then a key presses a hardware button; any other key cancels.
+// Ctrl-Y then a key presses a hardware button or rotates the device; any other key cancels.
 const BUTTON_KEYS: Record<string, Button> = { h: "home", l: "lock", s: "siri", "+": "volume-up", "-": "volume-down" };
+const ROTATE_KEYS: Record<string, number> = { r: 1, "\x1b[C": 1, "\x1b[D": -1 }; // r and → clockwise, ← anticlockwise
 let buttonPrefix = false;
+
+function rotate(by: number) {
+	quarter = (quarter + by + 4) % 4;
+	send(`orientation ${ORIENTATIONS[quarter]}`);
+	relayout();
+}
 
 function onInput(d: Buffer) {
 	for (const [tok, b, x, y, kind] of d.toString().matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])|\x1b\[[ABCD]|[\s\S]/g)) {
@@ -272,10 +339,16 @@ function onInput(d: Buffer) {
 			buttonPrefix = false;
 			status();
 			const button = BUTTON_KEYS[tok.toLowerCase()];
+			const turn = ROTATE_KEYS[tok.length > 1 ? tok : tok.toLowerCase()];
 			if (button) buttonLines(button).forEach(send);
+			else if (turn) rotate(turn);
+			else if (tok.toLowerCase() === "z") {
+				zoom = !zoom;
+				relayout();
+			}
 		} else if (tok === "\x19") {
 			buttonPrefix = true;
-			status("h home  l lock  s siri  +/- volume  (other: cancel)");
+			status("h home l lock s siri +/- vol r/←/→ rotate z zoom");
 		} else if (keys.has(tok)) press(keys.get(tok)!);
 	}
 }

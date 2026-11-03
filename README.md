@@ -32,7 +32,7 @@ pi install git:github.com/bitmonkeyhouse/pisim
 
 ## The viewer
 
-Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`). With several booted and no name given, pisim asks which one. It splits your herdr pane and shows the simulator on the right.
+Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`). With several booted and no name given, pisim asks which one. It splits your herdr pane and shows the simulator on the right at its real physical size, as Simulator.app's Physical Size, worked out from the dimensions of the display the terminal is on; move the window to another display and it resizes to match. If the pane is too small for that, the device shrinks to fit.
 
 | In the pane | Does |
 |---|---|
@@ -40,6 +40,8 @@ Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`).
 | Drag | Swipe or scroll; long-presses and flicks work too |
 | Type | Types into the focused field; Enter, Backspace, Tab, Esc and arrows work |
 | Ctrl-Y, then `h` / `l` / `s` / `+` / `-` | Home, Lock (again to wake), Siri, volume up / down |
+| Ctrl-Y, then `r` or `→` / `←` | Rotate the device clockwise / anticlockwise |
+| Ctrl-Y, then `z` | Zoom to fill the pane, or back to actual size |
 | Ctrl-C | Close the pane |
 
 Click the pane first so it has your keyboard. The scroll wheel goes to herdr, not the simulator, so drag to scroll. Typing follows the simulator's hardware keyboard layout: US, or British for `en_GB` simulators.
@@ -73,7 +75,8 @@ These use private Apple frameworks (CoreSimulator, AccessibilityPlatformTranslat
 
 - Single touch only: no pinch or two-finger gestures. Long hardware button presses aren't supported.
 - Only US and British keyboard layouts are mapped; characters outside the layout (é, emoji) can't be typed.
-- Tested on iPhones. Rotation and the iPhone Duo's inner display are untested, and devices whose screen doesn't match their bezel (such as the Duo) are shown without one.
+- Tested on iPhones. The iPhone Duo's inner display is untested, and devices whose screen doesn't match their bezel (such as the Duo) are shown without one.
+- The viewer starts the device in portrait. While it's rotated, `sim_tap` by `x`,`y` or by label taps in the wrong place: the agent tools don't know the device has turned.
 
 ## Credits
 
