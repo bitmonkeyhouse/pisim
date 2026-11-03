@@ -4,11 +4,12 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type Device, listBooted, screenshot } from "./sim.ts";
+import { axe, describe, type Device, listBooted, screenshot } from "./sim.ts";
 
 const run = promisify(execFile);
 const viewer = join(dirname(fileURLToPath(import.meta.url)), "viewer.ts");
 const label = (d: Device) => `${d.name} (${d.runtime})`;
+const device = Type.Optional(Type.String({ description: "Simulator name or udid; defaults to the one opened with /sim or the only booted one" }));
 
 export default function (pi: ExtensionAPI) {
 	let current: Device | undefined; // last device opened with /sim; default for sim_screenshot
@@ -56,7 +57,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Take a screenshot of a booted iOS simulator and return it as an image.",
 		promptSnippet: "Capture the current screen of a booted iOS simulator",
 		parameters: Type.Object({
-			device: Type.Optional(Type.String({ description: "Simulator name or udid; defaults to the one opened with /sim or the only booted one" })),
+			device,
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const device = await pick(params.device ?? "", ctx);
@@ -68,6 +69,62 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: { udid: device.udid },
 			};
+		},
+	});
+
+	const done = (udid: string, text: string) => ({ content: [{ type: "text" as const, text }], details: { udid } });
+
+	pi.registerTool({
+		name: "sim_describe",
+		label: "Simulator UI",
+		description:
+			"List the accessibility elements on a booted iOS simulator's screen, one per line: type, label, id, value and frame as @x,y wxh in points (origin top-left). Use it to find targets for sim_tap.",
+		promptSnippet: "List the on-screen UI elements of a booted iOS simulator",
+		parameters: Type.Object({ device }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { udid } = await pick(params.device ?? "", ctx);
+			return done(udid, await describe(udid));
+		},
+	});
+
+	pi.registerTool({
+		name: "sim_tap",
+		label: "Simulator tap",
+		description:
+			"Tap on a booted iOS simulator, either an element by accessibility label or id (waits up to 3s for it to appear), or a point x,y in points (origin top-left, as reported by sim_describe; screenshot pixels divided by the device scale).",
+		promptSnippet: "Tap an element or point on a booted iOS simulator",
+		promptGuidelines: ["After sim_tap or sim_type, check the result with sim_describe or sim_screenshot; taps are fire-and-forget."],
+		parameters: Type.Object({
+			label: Type.Optional(Type.String({ description: "Accessibility label of the element to tap" })),
+			id: Type.Optional(Type.String({ description: "Accessibility identifier of the element to tap" })),
+			x: Type.Optional(Type.Number({ description: "X in points" })),
+			y: Type.Optional(Type.Number({ description: "Y in points" })),
+			device,
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { label: l, id, x, y } = params;
+			const target =
+				x !== undefined && y !== undefined ? ["-x", String(x), "-y", String(y)]
+				: l ? ["--label", l, "--wait-timeout", "3"]
+				: id ? ["--id", id, "--wait-timeout", "3"]
+				: undefined;
+			if (!target) throw new Error("sim_tap needs label, id, or both x and y");
+			const { udid } = await pick(params.device ?? "", ctx);
+			await axe("tap", ...target, "--udid", udid);
+			return done(udid, `Tapped ${l ? `"${l}"` : id ? `id=${id}` : `${x},${y}`}`);
+		},
+	});
+
+	pi.registerTool({
+		name: "sim_type",
+		label: "Simulator type",
+		description: "Type text into the focused field of a booted iOS simulator (tap the field first). US keyboard characters only.",
+		promptSnippet: "Type text into a booted iOS simulator",
+		parameters: Type.Object({ text: Type.String({ description: "Text to type" }), device }),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { udid } = await pick(params.device ?? "", ctx);
+			await axe("type", "--udid", udid, "--", params.text);
+			return done(udid, `Typed ${JSON.stringify(params.text)}`);
 		},
 	});
 }
