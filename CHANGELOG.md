@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.12.0] - 2026-11-03
+
+- Rotate the device from the viewer: Ctrl-Y then `r` or `→` (clockwise) or `←` (anticlockwise). The picture, bezel and clicks turn with it.
+- The viewer shows the device at its real physical size, following the display the terminal window is on; Ctrl-Y then `z` zooms to fill the pane.
+
 ## [0.11.0] - 2026-11-03
 
 - Screenshots at the top of the README.
