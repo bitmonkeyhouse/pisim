@@ -2,7 +2,8 @@
 // clicks tap, drags swipe, typing types. Frames come from simhelper video only when the display changes;
 // the device bezel is a second image drawn on top. Ctrl-Y then h/l/s/+/- presses Home, Lock, Siri or
 // volume up/down, r or the arrows rotate the device, z zooms to fill the pane, and on a foldable
-// o/c/p open, close or half-fold it and f toggles open and closed; Ctrl-C quits.
+// o/c/p open, close or half-fold it and f toggles open and closed; Ctrl-C quits. The herdr pane widens
+// when a turned or opened device needs it (fitPane).
 // Usage: node viewer.ts <udid> [label]
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
@@ -19,7 +20,8 @@ if (!udid) {
 }
 
 type Box = { col: number; row: number; c: number; r: number }; // 0-based cell position and size in cells
-type Layout = { w: number; h: number; screen: Box; bezel?: Box & { png: Buffer } };
+// `need` is the pane width in cells that fits the device at physical size, if that's known.
+type Layout = { w: number; h: number; screen: Box; bezel?: Box & { png: Buffer }; need?: number };
 
 const ESC = "\x1b";
 const out = process.stdout;
@@ -127,10 +129,12 @@ async function layoutFor(w: number, h: number): Promise<Layout> {
 	const b = frame && turnBezel(frame, turn());
 	const dev = b ?? { w, h, x: 0, y: 0, hw: w, hh: h };
 	const fit = Math.min((Math.max(1, cols - 4) * cell.w) / dev.w, (Math.max(1, rows - 2) * cell.h) / dev.h);
-	const s = zoom ? fit : Math.min(fit, await naturalScale());
+	const natural = await naturalScale();
+	const s = zoom ? fit : Math.min(fit, natural);
+	const need = natural < Infinity ? Math.ceil((dev.w * natural) / cell.w) + 5 : undefined; // margin, and a cell for padLeft
 	const c = Math.max(1, Math.round((dev.hw * s) / cell.w));
 	const r = Math.max(1, Math.round((dev.hh * s) / cell.h));
-	const bare = { w, h, screen: { col: centre(cols, c), row: centre(rows, r), c, r } };
+	const bare = { w, h, screen: { col: centre(cols, c), row: centre(rows, r), c, r }, need };
 	if (!b) return bare;
 
 	const sx = (c * cell.w) / b.hw;
@@ -164,7 +168,40 @@ async function layoutFor(w: number, h: number): Promise<Layout> {
 		h,
 		screen: { col: col + (padLeft + holeX) / cell.w, row: row + (padTop + holeY) / cell.h, c, r },
 		bezel: { col, row, c: bc, r: br, png },
+		need,
 	};
+}
+
+// When the device turns or folds, the herdr pane is widened if the device no longer fits at physical
+// size, and put back to its old width once it fits again, unless it was resized by hand in between.
+let shape: string | undefined; // the shown screen's size when the pane was last fitted
+let restoreCols: number | undefined; // the pane's width before it was widened
+let setCols: number | undefined; // the width it was widened to
+async function fitPane(need: number) {
+	const pane = process.env.HERDR_PANE_ID;
+	if (!pane) return;
+	const cols = out.columns;
+	const base = restoreCols !== undefined && cols === setCols ? restoreCols : cols;
+	const target = Math.max(need, base);
+	restoreCols = target > base ? base : undefined;
+	setCols = cols; // until the resize says otherwise
+	if (target === cols) return;
+	type Rect = { x: number; width: number };
+	const { layout: l } = JSON.parse((await run("herdr", ["pane", "layout", "--pane", pane])).stdout).result;
+	const me: Rect = l.panes.find((p: { pane_id: string }) => p.pane_id === pane).rect;
+	// The innermost side-by-side split holding the pane; resizing moves its divider.
+	const split: Rect | undefined = l.splits
+		.filter((t: { direction: string; rect: Rect }) => t.direction === "right" && t.rect.x <= me.x && me.x + me.width <= t.rect.x + t.rect.width)
+		.map((t: { rect: Rect }) => t.rect)
+		.sort((a: Rect, b: Rect) => a.width - b.width)[0];
+	if (!split) return;
+	const delta = Math.min(target - cols, split.width - me.width - 40); // leaves the panes beside it 40 columns
+	if (delta === 0) return;
+	const growsLeft = me.x > split.x; // the divider is on the pane's left
+	const direction = delta > 0 === growsLeft ? "left" : "right";
+	const { stdout } = await run("herdr", ["pane", "resize", "--pane", pane, "--direction", direction, "--amount", String(Math.abs(delta) / split.width)]);
+	const after = JSON.parse(stdout).result.resize.layout.panes.find((p: { pane_id: string }) => p.pane_id === pane);
+	if (after) setCols = cols + after.rect.width - me.width; // herdr's widths include the pane's border
 }
 
 // The bezel is image 2, on top. The screen rotates through images 1, 3 and 4, each new frame on a
@@ -211,6 +248,11 @@ async function relayout() {
 		const odd = turn() % 2 === 1;
 		const l = await layoutFor(odd ? source.h : source.w, odd ? source.w : source.h);
 		layout = l;
+		const shown = `${l.w}x${l.h}`;
+		if (shown !== shape) {
+			if (shape && !zoom && l.need) fitPane(l.need).catch(() => {}); // the pane's resize lays out again
+			shape = shown;
+		}
 		out.write(`${ESC}_Ga=d,d=A,q=2${ESC}\\${ESC}[2J`);
 		if (l.bezel) place(2, BEZEL_Z, l.bezel, l.bezel.png);
 		video?.stdin!.write(`rotate ${turn()}\nsize ${l.screen.c * cell.w} ${l.screen.r * cell.h}\n`);

@@ -32,7 +32,7 @@ pi install git:github.com/bitmonkeyhouse/pisim
 
 ## The viewer
 
-Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`). With several booted and no name given, pisim asks which one. It splits your herdr pane and shows the simulator on the right at its real physical size, as Simulator.app's Physical Size, worked out from the dimensions of the display the terminal is on; move the window to another display and it resizes to match. If the pane is too small for that, the device shrinks to fit.
+Run `/sim` in pi, optionally with a simulator's name or UDID (`/sim iPhone 16`). With several booted and no name given, pisim asks which one. It splits your herdr pane and shows the simulator on the right at its real physical size, as Simulator.app's Physical Size, worked out from the dimensions of the display the terminal is on; move the window to another display and it resizes to match. If the pane is too small for that, the device shrinks to fit. When the device turns or a foldable opens and no longer fits, the pane widens, and goes back to its old width once the device fits again (unless you've resized it yourself in between, or zoomed with Ctrl-Y `z`).
 
 | In the pane | Does |
 |---|---|
