@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.0.0] - 2026-11-04
+
+- First stable release, and the first published to npm as `@bitmonkey/pisim`. No changes from 0.16.0.
+
 ## [0.16.0] - 2026-11-03
 
 - `/sim` with no simulator booted lists your iOS simulators, newest runtime first, and boots the one you pick (without opening Simulator.app).
