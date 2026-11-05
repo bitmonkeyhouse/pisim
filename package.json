@@ -11,7 +11,7 @@
   "type": "module",
   "os": ["darwin"],
   "engines": { "node": ">=22.19.0" },
-  "files": ["index.ts", "sim.ts", "viewer.ts", "bezel.ts", "simhelper.m", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
+  "files": ["index.ts", "sim.ts", "viewer.ts", "bezel.ts", "ts.mjs", "simhelper.m", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
   "pi": { "extensions": ["./index.ts"] },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

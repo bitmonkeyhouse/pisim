@@ -8,7 +8,9 @@ import { Type } from "typebox";
 import { type AXNode, BUTTONS, boot, buttonLines, describe, type Device, keyLines, keymap, listBootable, listBooted, screenshot, simctl, startHid, uiTree } from "./sim.ts";
 
 const run = promisify(execFile);
-const viewer = join(dirname(fileURLToPath(import.meta.url)), "viewer.ts");
+const here = dirname(fileURLToPath(import.meta.url));
+const viewer = join(here, "viewer.ts");
+const stripTypes = join(here, "ts.mjs");
 const label = (d: Device) => `${d.name} (${d.runtime})`;
 const device = Type.Optional(Type.String({ description: "Simulator name or udid; defaults to the one opened with /sim or the only booted one" }));
 
@@ -59,7 +61,7 @@ export default function (pi: ExtensionAPI) {
 				const pane = JSON.parse(stdout).result.pane.pane_id as string;
 				await run("herdr", ["pane", "rename", pane, `${device.name} (ctrl-y for menu)`]);
 				const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`;
-				await run("herdr", ["pane", "run", pane, `exec ${q(process.execPath)} ${q(viewer)} ${device.udid} ${q(device.name)}`]);
+				await run("herdr", ["pane", "run", pane, `exec ${q(process.execPath)} --disable-warning=ExperimentalWarning --import ${q(stripTypes)} ${q(viewer)} ${device.udid} ${q(device.name)}`]);
 			} catch (e) {
 				ctx.ui.notify((e as Error).message, "error");
 			}
