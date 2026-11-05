@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.0.1] - 2026-11-05
+
+- `/sim` works when pisim is installed from npm. The viewer failed to start because Node won't strip TypeScript types under `node_modules` ([#1](https://github.com/bitmonkeyhouse/pisim/issues/1)).
+
 ## [1.0.0] - 2026-11-04
 
 - First stable release, and the first published to npm as `@bitmonkey/pisim`. No changes from 0.16.0.

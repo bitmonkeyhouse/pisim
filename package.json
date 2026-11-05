@@ -1,6 +1,6 @@
 {
   "name": "@bitmonkey/pisim",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi extension: watch and drive a booted iOS Simulator from a herdr pane, and let the agent see, tap and type into it",
   "keywords": ["pi-package", "pi", "ios", "simulator", "xcode", "herdr"],
   "license": "MIT",
